@@ -139,6 +139,10 @@ function mapQuote(row: Record<string, unknown>): QuoteRaw | null {
     ret20d: toNum(row.f110),
     ret60d: toNum(row.f24),
     ret1y: toNum(row.f25),
+    // 今年涨跌幅用 f25（东方财富「年初至今」）。2026-11-11 对 510300/159915/513100/513290
+    // 用日 K fqt=1 按 (session_close / last_close_of_previous_year)-1 核对，与 f25 一致；
+    // 同期 f127 为 -0.27/1.41/2.41/5.47，与该公式（约 -11.1/-21.0/16.1/25.3）不符，故不用 f127。
+    ytdChangePct: toNum(row.f25),
     statusHint: toNum(row.f107),
   };
 }

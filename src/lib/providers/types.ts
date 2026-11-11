@@ -24,6 +24,7 @@ export interface QuoteRaw {
   ret20d: number | null;
   ret60d: number | null;
   ret1y: number | null;
+  ytdChangePct: number | null;
   statusHint: number | null;
 }
 

@@ -3,11 +3,46 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { COLUMNS, DEFAULT_VISIBLE, type ColumnKey } from "@/components/columns";
+import { isPrevCloseCacheFresh, readPrevCloseCache, writePrevCloseCache } from "@/lib/client/prev-close-cache";
 import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands } from "@/lib/format";
+import { shanghaiDateString } from "@/lib/market-hours";
 import type { EtfCategory, EtfRow, MarketPayload } from "@/lib/types";
 import { ALL_CATEGORIES } from "@/lib/types";
 import { isWatched, loadWatchlist, saveWatchlist, toggleWatch, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
+
+type MarketView = "today" | "prev";
+const COLUMN_STORE_KEY = "etf-market-columns-v2";
+const COLUMN_STORE_LEGACY = "etf-market-columns-v1";
+
+function migrateVisible(saved: ColumnKey[]): ColumnKey[] {
+  const next = [...saved];
+  const insertAfter = (key: ColumnKey, after: ColumnKey) => {
+    if (next.includes(key)) return;
+    const i = next.indexOf(after);
+    if (i >= 0) next.splice(i + 1, 0, key);
+    else next.push(key);
+  };
+  insertAfter("ytdChangePct", "aum");
+  insertAfter("managementFee", "ytdChangePct");
+  return next;
+}
+
+function loadVisibleColumns(): ColumnKey[] {
+  try {
+    const v2 = localStorage.getItem(COLUMN_STORE_KEY);
+    if (v2) return JSON.parse(v2) as ColumnKey[];
+    const v1 = localStorage.getItem(COLUMN_STORE_LEGACY);
+    if (v1) {
+      const migrated = migrateVisible(JSON.parse(v1) as ColumnKey[]);
+      localStorage.setItem(COLUMN_STORE_KEY, JSON.stringify(migrated));
+      return migrated;
+    }
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_VISIBLE;
+}
 
 type SortDir = "asc" | "desc";
 
@@ -145,6 +180,8 @@ function cellValue(row: EtfRow, key: ColumnKey): string {
       return formatPct(row.premiumPct);
     case "aum":
       return formatAum(row.aum);
+    case "ytdChangePct":
+      return formatPct(row.ytdChangePct);
     case "managementFee":
       return row.managementFee === null ? "—" : `${row.managementFee.toFixed(2)}%`;
     case "custodyFee":
@@ -183,7 +220,9 @@ function HeaderStat({ label, value, sub }: { label: string; value: string; sub?:
 }
 
 export function MarketTerminal() {
-  const [data, setData] = useState<MarketPayload | null>(null);
+  const [view, setView] = useState<MarketView>("today");
+  const [liveData, setLiveData] = useState<MarketPayload | null>(null);
+  const [prevData, setPrevData] = useState<MarketPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
@@ -197,26 +236,23 @@ export function MarketTerminal() {
 
   useEffect(() => {
     setGroups(loadWatchlist());
-    try {
-      const saved = localStorage.getItem("etf-market-columns-v1");
-      if (saved) setVisible(JSON.parse(saved));
-    } catch {
-      /* ignore */
-    }
+    setVisible(loadVisibleColumns());
   }, []);
 
   const persistCols = (next: ColumnKey[]) => {
     setVisible(next);
-    localStorage.setItem("etf-market-columns-v1", JSON.stringify(next));
+    localStorage.setItem(COLUMN_STORE_KEY, JSON.stringify(next));
   };
 
-  const load = useCallback(async () => {
+  const data = view === "prev" ? prevData : liveData;
+
+  const loadLive = useCallback(async () => {
     try {
       setError(null);
       const res = await fetch("/api/market", { cache: "no-store" });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "行情加载失败");
-      setData(json);
+      setLiveData(json);
     } catch (err) {
       setError(err instanceof Error ? err.message : "行情加载失败");
     } finally {
@@ -224,11 +260,50 @@ export function MarketTerminal() {
     }
   }, []);
 
+  const loadPrev = useCallback(async () => {
+    const today = shanghaiDateString();
+    try {
+      setError(null);
+      const cached = await readPrevCloseCache();
+      if (isPrevCloseCacheFresh(cached, today) && cached) {
+        setPrevData(cached.payload);
+        setLoading(false);
+        return;
+      }
+      setLoading(true);
+      const res = await fetch("/api/market?view=prev", { cache: "no-store" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "上一交易日收盘快照加载失败");
+      setPrevData(json);
+      if (json?.asOfDate && Array.isArray(json.list)) {
+        await writePrevCloseCache({
+          asOfDate: json.asOfDate,
+          shanghaiDate: today,
+          savedAt: Date.now(),
+          payload: json,
+        });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "上一交易日收盘快照加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const load = useCallback(() => {
+    return view === "prev" ? loadPrev() : loadLive();
+  }, [view, loadPrev, loadLive]);
+
   useEffect(() => {
-    load();
-    const id = window.setInterval(load, 15000);
-    return () => window.clearInterval(id);
-  }, [load]);
+    setLoading(true);
+    if (view === "today") {
+      loadLive();
+      const id = window.setInterval(loadLive, 15000);
+      return () => window.clearInterval(id);
+    }
+    loadPrev();
+    return undefined;
+  }, [view, loadLive, loadPrev]);
 
   const updateFilter = <K extends keyof Filters>(key: K, value: Filters[K]) => {
     setFilters((prev) => ({ ...prev, [key]: value }));
@@ -290,7 +365,7 @@ export function MarketTerminal() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `etf-market-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `etf-market-${view === "prev" && data?.asOfDate ? data.asOfDate : new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -313,24 +388,60 @@ export function MarketTerminal() {
             <div className="text-xs text-terminal-muted">中国沪深场内 ETF 全市场监控终端 V1.0</div>
           </div>
           <nav className="flex items-center gap-3 text-sm">
-            <span className="text-terminal-text">全市场</span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setView("prev")}
+                className={cn(
+                  "rounded border px-2 py-0.5 text-xs",
+                  view === "prev"
+                    ? "border-terminal-text text-terminal-text"
+                    : "border-transparent text-terminal-muted hover:text-terminal-text",
+                )}
+              >
+                上一日
+              </button>
+              <button
+                type="button"
+                onClick={() => setView("today")}
+                className={cn(
+                  "rounded border px-2 py-0.5 text-xs",
+                  view === "today"
+                    ? "border-terminal-text text-terminal-text"
+                    : "border-transparent text-terminal-muted hover:text-terminal-text",
+                )}
+              >
+                今日市场
+              </button>
+            </div>
             <Link href="/watchlist" className="text-terminal-muted hover:text-terminal-text">
               我的自选
             </Link>
-            <button type="button" onClick={load} className="rounded border border-terminal-border px-2 py-0.5 text-xs text-terminal-muted hover:text-terminal-text">
+            <button type="button" onClick={() => void load()} className="rounded border border-terminal-border px-2 py-0.5 text-xs text-terminal-muted hover:text-terminal-text">
               刷新
             </button>
           </nav>
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-terminal-border px-3 py-1 text-[11px] text-terminal-muted">
           <span>数据来源：{data?.source ?? "东方财富公开行情"}</span>
-          <span>行情时间：{formatShanghai(data?.quoteTime ?? null)}</span>
+          {view === "prev" ? (
+            <>
+              <span>收盘日期 {data?.asOfDate ?? "—"}</span>
+              <span>上一交易日收盘（本地缓存，非实时行情）</span>
+            </>
+          ) : (
+            <>
+              <span>行情时间：{formatShanghai(data?.quoteTime ?? null)}</span>
+              <span>{data?.delayed ? "可能延迟，非正式交易所专线" : data ? "当前按日终/非交易时段展示" : ""}</span>
+            </>
+          )}
           <span>页面拉取：{formatShanghai(data?.fetchedAt ?? null)}</span>
           <span>状态：{error ? "接口异常" : data?.freshness ?? (loading ? "加载中" : "—")}</span>
-          <span>{data?.delayed ? "可能延迟，非正式交易所专线" : data ? "当前按日终/非交易时段展示" : ""}</span>
           {data ? (
             <span>
-              资料覆盖 {data.f10Coverage}/{data.list.length} · IOPV 覆盖 {data.iopvCoverage}/{data.list.length}
+              {view === "prev"
+                ? `资料覆盖 ${data.f10Coverage}/${data.list.length} · 折溢价/IOPV 不适用于收盘快照`
+                : `资料覆盖 ${data.f10Coverage}/${data.list.length} · IOPV 覆盖 ${data.iopvCoverage}/${data.list.length}`}
             </span>
           ) : null}
         </div>
@@ -339,7 +450,13 @@ export function MarketTerminal() {
       {error ? (
         <div className="m-3 border border-up/40 bg-up/10 px-3 py-2 text-sm text-up">加载失败：{error}。页面不会用模拟数据替代真实行情。</div>
       ) : null}
-      {loading && !data ? <div className="px-3 py-10 text-sm text-terminal-muted">正在从服务端拉取沪深场内 ETF 全量行情…</div> : null}
+      {loading && !data ? (
+        <div className="px-3 py-10 text-sm text-terminal-muted">
+          {view === "prev"
+            ? "正在构建上一交易日收盘快照。首次需按代码拉取日 K，可能需要一两分钟；完成后会写入本地缓存，之后打开该交易日无需再请求。"
+            : "正在从服务端拉取沪深场内 ETF 全量行情…"}
+        </div>
+      ) : null}
 
       {ov ? (
         <>
@@ -372,7 +489,7 @@ export function MarketTerminal() {
             <RankList title="跌幅榜 TOP 5" rows={ov.topLosers} field="changePct" />
             <RankList title="成交额榜 TOP 5" rows={ov.topTurnover} field="turnover" />
             <div className="border-r border-terminal-border last:border-r-0 px-3 py-2">
-              <div className="mb-1 text-[12px] text-terminal-muted">当日市场热点分类</div>
+              <div className="mb-1 text-[12px] text-terminal-muted">{view === "prev" ? "收盘日市场热点分类" : "当日市场热点分类"}</div>
               <div className="text-[10px] text-terminal-muted mb-1">按分类成交额加权涨跌幅排序</div>
               {ov.hotspots.map((h) => (
                 <button
@@ -563,7 +680,7 @@ export function MarketTerminal() {
                     </button>
                   </td>
                   {COLUMNS.filter((c) => visible.includes(c.key)).map((c) => {
-                    const colored = ["change", "changePct", "premiumPct", "ret5d", "ret20d", "ret60d", "ret1y"].includes(c.key);
+                    const colored = ["change", "changePct", "premiumPct", "ret5d", "ret20d", "ret60d", "ret1y", "ytdChangePct"].includes(c.key);
                     const href = `/etf/${row.code}?market=${row.market}`;
                     const inner = (
                       <span className={cn(c.numeric && "font-mono tabular-nums", colored && changeClass(row[c.key] as number | null))}>

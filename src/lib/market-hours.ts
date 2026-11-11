@@ -28,3 +28,17 @@ export function marketFreshness(now = Date.now()): { freshness: DataFreshness; d
   if (hhmm > 1505) return { freshness: "已收盘（日终行情）", delayed: false };
   return { freshness: "非交易时段", delayed: true };
 }
+
+export function shanghaiDateString(ts = Date.now()): string {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: SHANGHAI,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(new Date(ts));
+}
+
+export function shanghaiSessionCloseUnix(dateStr: string): number {
+  return Math.floor(new Date(`${dateStr}T15:00:00+08:00`).getTime() / 1000);
+}

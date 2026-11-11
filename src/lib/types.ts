@@ -77,6 +77,7 @@ export interface EtfRow {
   ret20d: number | null;
   ret60d: number | null;
   ret1y: number | null;
+  ytdChangePct: number | null;
   fundType: string | null;
   level2Class: string | null;
   indexCode: string | null;
@@ -135,6 +136,8 @@ export interface MarketPayload {
   overview: MarketOverview;
   categories: CategoryStat[];
   list: EtfRow[];
+  view: "live" | "prev-close";
+  asOfDate: string | null;
 }
 
 export interface KlineBar {

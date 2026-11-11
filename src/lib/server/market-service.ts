@@ -33,7 +33,7 @@ function premiumPct(last: number | null, iopv: number | null): number | null {
   return ((last - iopv) / iopv) * 100;
 }
 
-function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundProfile, iopv?: IopvSnapshot): EtfRow {
+export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundProfile, iopv?: IopvSnapshot): EtfRow {
   const last = q.last;
   const category = classifyEtf(f10 ?? null);
   const spread =
@@ -70,6 +70,7 @@ function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundProfile, i
     ret20d: q.ret20d,
     ret60d: q.ret60d,
     ret1y: q.ret1y,
+    ytdChangePct: q.ytdChangePct,
     fundType: f10?.fundType ?? null,
     level2Class: f10?.level2Class ?? null,
     indexCode: f10?.indexCode ?? null,
@@ -89,6 +90,23 @@ function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundProfile, i
 
 function f10Fresh(p: FundProfile | undefined) {
   return Boolean(p && Date.now() - p.updatedAt < F10_TTL_MS);
+}
+
+export function getCachedF10(code: string): FundProfile | undefined {
+  return f10Memory[code];
+}
+
+export async function ensureF10Ready(codes: string[]) {
+  const stale = codes.filter((c) => !f10Fresh(f10Memory[c])).length;
+  if (stale === 0) return;
+  if (!f10Warming) {
+    f10Warming = warmF10(codes).finally(() => {
+      f10Warming = null;
+    });
+  }
+  if (Object.keys(f10Memory).length < codes.length * 0.9) {
+    await Promise.race([f10Warming, new Promise((r) => setTimeout(r, 55000))]);
+  }
 }
 
 function iopvFresh(p: IopvSnapshot | undefined) {
@@ -141,7 +159,7 @@ function ensureWarmers(codes: string[], secids: { code: string; secid: string }[
   }
 }
 
-function buildCategories(list: EtfRow[]): CategoryStat[] {
+export function buildCategories(list: EtfRow[]): CategoryStat[] {
   return ALL_CATEGORIES.map((category) => {
     const items = list.filter((x) => x.category === category);
     const withPx = items.filter((x) => x.changePct !== null);
@@ -185,7 +203,7 @@ function buildCategories(list: EtfRow[]): CategoryStat[] {
   });
 }
 
-function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
+export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   const active = list.filter((x) => x.status !== "终止上市");
   const withPx = active.filter((x) => x.changePct !== null);
   const aumItems = active.filter((x) => x.aum !== null);
@@ -222,7 +240,7 @@ function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   };
 }
 
-async function loadQuotes() {
+export async function loadQuotes() {
   const cached = memoryGet<{ total: number; quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number }>(
     "universe",
   );
@@ -261,6 +279,8 @@ export async function getMarketPayload(): Promise<MarketPayload> {
     "基金份额净值 NAV（stock/get f131）不用于折溢价。跨境品种 IOPV/净值可能因时差滞后。",
     "成交额、份额变化均不等于资金净流入。",
     "已实现跟踪误差暂无法从公开接口获取；如有数字仅为合同目标。",
+    "今年涨跌幅取自东方财富 clist f25（年初至今），与日 K 按「上年最后交易日收盘价」计算的结果一致；抽样核验过 f127 并不是今年以来，故未使用。原「近一年涨跌幅」列仍映射 f25，今日市场中会与今年涨跌幅相同。",
+    "管理费率来自 F10 DEC_GUANLIFEI，单位为年费率百分比。",
   ];
   if (iopvCoverage < list.length) {
     notes.push(`IOPV 缓存覆盖 ${iopvCoverage}/${list.length}，未覆盖品种折溢价显示为缺失，不会用净值或昨收代替。`);
@@ -281,6 +301,8 @@ export async function getMarketPayload(): Promise<MarketPayload> {
     overview: buildOverview(list),
     categories: buildCategories(list.filter((x) => x.status !== "终止上市")),
     list,
+    view: "live",
+    asOfDate: null,
   };
 }
 
@@ -369,6 +391,7 @@ export async function getEtfDetail(code: string, marketHint?: number): Promise<E
       ret20d: null,
       ret60d: null,
       ret1y: null,
+      ytdChangePct: null,
       statusHint: null,
     };
   }

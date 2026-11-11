@@ -17,6 +17,7 @@ export type ColumnKey =
   | "iopv"
   | "premiumPct"
   | "aum"
+  | "ytdChangePct"
   | "managementFee"
   | "custodyFee"
   | "foundDate"
@@ -44,6 +45,8 @@ export const COLUMNS: ColumnDef[] = [
   { key: "volumeRatio", label: "量比", defaultVisible: true, align: "right", numeric: true },
   { key: "premiumPct", label: "折溢价率", defaultVisible: true, align: "right", numeric: true },
   { key: "aum", label: "基金规模", defaultVisible: true, align: "right", numeric: true },
+  { key: "ytdChangePct", label: "今年涨跌幅", defaultVisible: true, align: "right", numeric: true },
+  { key: "managementFee", label: "管理费率", defaultVisible: true, align: "right", numeric: true },
   { key: "indexName", label: "跟踪指数", defaultVisible: true },
   { key: "exchange", label: "交易所", defaultVisible: false },
   { key: "category", label: "ETF类型", defaultVisible: false },
@@ -53,7 +56,6 @@ export const COLUMNS: ColumnDef[] = [
   { key: "ask1", label: "卖一价", defaultVisible: false, align: "right", numeric: true },
   { key: "spread", label: "买卖价差", defaultVisible: false, align: "right", numeric: true },
   { key: "iopv", label: "IOPV", defaultVisible: false, align: "right", numeric: true },
-  { key: "managementFee", label: "管理费率", defaultVisible: false, align: "right", numeric: true },
   { key: "custodyFee", label: "托管费率", defaultVisible: false, align: "right", numeric: true },
   { key: "foundDate", label: "基金成立日期", defaultVisible: false },
   { key: "ret5d", label: "近5日涨跌幅", defaultVisible: false, align: "right", numeric: true },
