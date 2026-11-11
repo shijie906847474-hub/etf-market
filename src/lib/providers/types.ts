@@ -28,6 +28,12 @@ export interface QuoteRaw {
   statusHint: number | null;
 }
 
+export interface OfficialNav {
+  code: string;
+  date: string;
+  nav: number;
+}
+
 export interface MarketDataProvider {
   id: string;
   label: string;
@@ -37,4 +43,5 @@ export interface MarketDataProvider {
   fetchFundProfiles(codes: string[]): Promise<FundProfile[]>;
   fetchKline(secid: string, klt: 101 | 102 | 103, limit?: number): Promise<KlineBar[]>;
   fetchTrends(secid: string): Promise<{ preClose: number | null; points: TrendPoint[] }>;
+  fetchOfficialNav(code: string, asOfDate: string): Promise<OfficialNav | null>;
 }

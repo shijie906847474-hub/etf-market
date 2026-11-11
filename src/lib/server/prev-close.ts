@@ -1,4 +1,5 @@
 import { memoryGet, memorySet, readJsonFile, writeJsonFile } from "../cache";
+import { PREV_CLOSE_PAYLOAD_VERSION } from "../prev-close-version";
 import { shanghaiDateString, shanghaiSessionCloseUnix } from "../market-hours";
 import { getMarketProvider } from "../providers";
 import type { QuoteRaw } from "../providers/types";
@@ -10,6 +11,7 @@ const PREV_TTL_MS = 36 * 60 * 60 * 1000;
 const KLINE_CONCURRENCY = 10;
 const KLINE_LIMIT = 280;
 const ANCHOR_SECID = "1.510300";
+const CACHE_FILE_PREFIX = `prev-close-v${PREV_CLOSE_PAYLOAD_VERSION}`;
 
 let building: Promise<MarketPayload> | null = null;
 let buildingDate: string | null = null;
@@ -72,6 +74,11 @@ function hasTrade(bar: KlineBar): boolean {
   return (typeof bar.volume === "number" && bar.volume > 0) || (typeof bar.amount === "number" && bar.amount > 0);
 }
 
+function closePremiumFromNav(close: number | null, nav: number | null): number | null {
+  if (close === null || nav === null || !Number.isFinite(close) || !Number.isFinite(nav) || nav === 0) return null;
+  return ((close - nav) / nav) * 100;
+}
+
 function quoteFromBars(base: QuoteRaw, bars: KlineBar[], asOfDate: string, quoteTime: number): QuoteRaw {
   const bar = findBarOnDate(bars, asOfDate);
   if (!bar || !hasTrade(bar) || !Number.isFinite(bar.close)) {
@@ -121,29 +128,54 @@ async function buildPrevClosePayload(asOfDate: string): Promise<MarketPayload> {
   let klineOk = 0;
   let klineFail = 0;
   let traded = 0;
+  let navOk = 0;
 
   const quotes = await mapPool(universe.quotes, KLINE_CONCURRENCY, async (base) => {
-    try {
-      const bars = await provider.fetchKline(`${base.market}.${base.code}`, 101, KLINE_LIMIT);
-      klineOk += 1;
-      const q = quoteFromBars(base, bars, asOfDate, quoteTime);
-      if (q.last !== null) traded += 1;
-      return q;
-    } catch {
+    const [klineResult, officialNav] = await Promise.all([
+      provider.fetchKline(`${base.market}.${base.code}`, 101, KLINE_LIMIT).then(
+        (bars) => ({ ok: true as const, bars }),
+        () => ({ ok: false as const, bars: null }),
+      ),
+      provider.fetchOfficialNav(base.code, asOfDate).catch(() => null),
+    ]);
+    if (officialNav) navOk += 1;
+    if (!klineResult.ok || !klineResult.bars) {
       klineFail += 1;
-      return emptyQuote(base, quoteTime);
+      return { q: emptyQuote(base, quoteTime), officialNav };
     }
+    klineOk += 1;
+    const q = quoteFromBars(base, klineResult.bars, asOfDate, quoteTime);
+    if (q.last !== null) traded += 1;
+    return { q, officialNav };
   });
 
-  const list = quotes.map((q) => mergeRow(q, getCachedF10(q.code), undefined));
+  const list = quotes.map(({ q, officialNav }) => {
+    const row = mergeRow(q, getCachedF10(q.code), undefined);
+    const nav = officialNav && officialNav.date === asOfDate ? officialNav.nav : null;
+    const premium = closePremiumFromNav(row.last, nav);
+    if (premium === null) {
+      row.nav = null;
+      row.navDate = null;
+      row.premiumPct = null;
+      return row;
+    }
+    row.nav = nav;
+    row.navDate = asOfDate;
+    row.premiumPct = premium;
+    return row;
+  });
   const f10Coverage = list.filter((x) => x.fundType).length;
+  const navCoverage = list.filter((x) => x.nav !== null && x.premiumPct !== null).length;
   const notes = [
     `「上一日」展示 ${asOfDate} 这一完整交易日的收盘行情，不是今天的实时报价，也不会在收盘后改成当天。`,
     "上一交易日由沪深300ETF（510300）日 K 中「早于上海日历当天」的最后一根 K 线确定，会跳过周末与节假日。",
-    "价格、涨跌、成交额/量、换手、开高低取自该日 K 线；昨收为再前一交易日收盘价。IOPV、折溢价、买卖一档、价差、量比为盘中字段，收盘快照中显示为缺失。",
+    "价格、涨跌、成交额/量、换手、开高低取自该日 K 线；昨收为再前一交易日收盘价。买卖一档、价差、量比、IOPV 为盘中字段，收盘快照中显示为缺失。",
+    "收盘溢价率（净值）= (该日收盘价 − 当日基金份额净值) / 当日净值 × 100。净值取自东方财富基金历史净值接口 lsjz 的 DWJZ，且必须 FSRQ 等于该收盘日；不会用更早的净值、IOPV、昨收或估值去填补。",
+    "当日净值尚未公布的品种（跨境/QDII 常见为 T+1 才披露）收盘溢价显示为 —。今日市场的折溢价仍只用盘中 IOPV，不会改用净值。",
     "今年涨跌幅按该日收盘价相对上一自然年最后交易日收盘价计算：(收盘价 / 上年最后收盘价) - 1；若当年上市、没有上年收盘，则用上市后最早收盘价。",
-    "基金规模、管理费率、跟踪指数等资料来自 F10（规模为 NEW_SCALE 及披露日，管理费率为 DEC_GUANLIFEI），不是盘中跳动字段。",
+    "基金规模、运作费率、跟踪指数等资料来自 F10（规模为 NEW_SCALE 及披露日；运作费率 = DEC_GUANLIFEI + DEC_TUOGUANFEI），不是盘中跳动字段。",
     `日 K 覆盖 ${klineOk}/${list.length}，失败 ${klineFail} 只；有成交的收盘记录 ${traded} 只。失败或当日无成交量/成交额的品种按无行情展示，不会用今价或昨收填补。`,
+    `净值覆盖 ${navCoverage}/${list.length}（同日 lsjz 返回 ${navOk} 只）；缺少同日净值或缺少有效收盘价时溢价为 —。`,
     "该快照按收盘日期缓存在服务端（内存与本地文件）以及浏览器本地，不按 15 秒轮询。",
   ];
 
@@ -155,6 +187,8 @@ async function buildPrevClosePayload(asOfDate: string): Promise<MarketPayload> {
     delayed: false,
     f10Coverage,
     iopvCoverage: 0,
+    navCoverage,
+    payloadVersion: PREV_CLOSE_PAYLOAD_VERSION,
     notes,
     overview: buildOverview(list),
     categories: buildCategories(list.filter((x) => x.status !== "终止上市")),
@@ -166,11 +200,11 @@ async function buildPrevClosePayload(asOfDate: string): Promise<MarketPayload> {
 
 export async function getPrevClosePayload(): Promise<MarketPayload> {
   const asOfDate = await resolvePrevTradeDate();
-  const memKey = `prev-close:${asOfDate}`;
+  const memKey = `${CACHE_FILE_PREFIX}:${asOfDate}`;
   const cached = memoryGet<MarketPayload>(memKey);
-  if (cached?.asOfDate === asOfDate && cached.list?.length) return cached;
-  const file = readJsonFile<MarketPayload>(`prev-close-${asOfDate}.json`);
-  if (file?.asOfDate === asOfDate && file.list?.length) {
+  if (cached?.asOfDate === asOfDate && cached.payloadVersion === PREV_CLOSE_PAYLOAD_VERSION && cached.list?.length) return cached;
+  const file = readJsonFile<MarketPayload>(`${CACHE_FILE_PREFIX}-${asOfDate}.json`);
+  if (file?.asOfDate === asOfDate && file.payloadVersion === PREV_CLOSE_PAYLOAD_VERSION && file.list?.length) {
     memorySet(memKey, file, PREV_TTL_MS);
     return file;
   }
@@ -179,7 +213,7 @@ export async function getPrevClosePayload(): Promise<MarketPayload> {
   building = buildPrevClosePayload(asOfDate)
     .then((payload) => {
       memorySet(memKey, payload, PREV_TTL_MS);
-      writeJsonFile(`prev-close-${asOfDate}.json`, payload);
+      writeJsonFile(`${CACHE_FILE_PREFIX}-${asOfDate}.json`, payload);
       return payload;
     })
     .finally(() => {

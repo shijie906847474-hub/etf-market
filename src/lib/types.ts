@@ -70,6 +70,7 @@ export interface EtfRow {
   spread: number | null;
   iopv: number | null;
   nav: number | null;
+  navDate: string | null;
   premiumPct: number | null;
   listedDate: string | null;
   quoteTime: number | null;
@@ -85,6 +86,7 @@ export interface EtfRow {
   benchmark: string | null;
   managementFee: number | null;
   custodyFee: number | null;
+  operatingFee: number | null;
   foundDate: string | null;
   orgName: string | null;
   fundManager: string | null;
@@ -120,8 +122,9 @@ export interface MarketOverview {
   flat: number;
   topGainers: EtfRow[];
   topLosers: EtfRow[];
-  topTurnover: EtfRow[];
-  hotspots: { category: EtfCategory; weightedReturn: number | null; turnover: number; count: number }[];
+  topVolumeUp: EtfRow[];
+  topVolumeDown: EtfRow[];
+  hotspots: { theme: string; weightedReturn: number | null; turnover: number; count: number }[];
 }
 
 export interface MarketPayload {
@@ -132,6 +135,8 @@ export interface MarketPayload {
   delayed: boolean;
   f10Coverage: number;
   iopvCoverage: number;
+  navCoverage?: number;
+  payloadVersion?: number;
   notes: string[];
   overview: MarketOverview;
   categories: CategoryStat[];

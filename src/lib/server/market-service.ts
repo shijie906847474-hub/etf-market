@@ -1,6 +1,7 @@
 import { memoryGet, memorySet, readJsonFile, writeJsonFile } from "../cache";
 import { classifyEtf, detectStatus } from "../classify";
-import { listedDateFromF26 } from "../format";
+import { buildThemeHotspots } from "../themes";
+import { listedDateFromF26, operatingFeeOf, VOLUME_RATIO_SURGE } from "../format";
 import { marketFreshness } from "../market-hours";
 import { getMarketProvider } from "../providers";
 import type {
@@ -33,6 +34,7 @@ function premiumPct(last: number | null, iopv: number | null): number | null {
   return ((last - iopv) / iopv) * 100;
 }
 
+
 export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundProfile, iopv?: IopvSnapshot): EtfRow {
   const last = q.last;
   const category = classifyEtf(f10 ?? null);
@@ -63,6 +65,7 @@ export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundPro
     spread,
     iopv: iopv?.iopv ?? null,
     nav: iopv?.nav ?? null,
+    navDate: null,
     premiumPct: premiumPct(last, iopv?.iopv ?? null),
     listedDate: listedDateFromF26(q.listedDateRaw),
     quoteTime: q.quoteTime,
@@ -78,6 +81,7 @@ export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundPro
     benchmark: f10?.benchmark ?? null,
     managementFee: f10?.managementFee ?? null,
     custodyFee: f10?.custodyFee ?? null,
+    operatingFee: operatingFeeOf(f10?.managementFee ?? null, f10?.custodyFee ?? null),
     foundDate: f10?.foundDate ?? null,
     orgName: f10?.orgName ?? null,
     fundManager: f10?.fundManager ?? null,
@@ -207,20 +211,29 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   const active = list.filter((x) => x.status !== "终止上市");
   const withPx = active.filter((x) => x.changePct !== null);
   const aumItems = active.filter((x) => x.aum !== null);
-  const sortable = active.filter((x) => x.status === "正常上市" || x.status === "无行情");
   const byRet = [...withPx].sort((a, b) => (b.changePct ?? 0) - (a.changePct ?? 0));
-  const byTurnover = [...sortable].sort((a, b) => (b.turnover ?? 0) - (a.turnover ?? 0));
+  const surged = active.filter(
+    (x) =>
+      x.status !== "暂停交易" &&
+      x.volumeRatio !== null &&
+      x.volumeRatio >= VOLUME_RATIO_SURGE &&
+      x.changePct !== null,
+  );
+  const topVolumeUp = surged
+    .filter((x) => (x.changePct ?? 0) > 0)
+    .sort((a, b) => (b.changePct ?? 0) - (a.changePct ?? 0))
+    .slice(0, 5);
+  const topVolumeDown = surged
+    .filter((x) => (x.changePct ?? 0) < 0)
+    .sort((a, b) => (a.changePct ?? 0) - (b.changePct ?? 0))
+    .slice(0, 5);
   const cats = buildCategories(active);
-  const hotspots = [...cats]
-    .filter((c) => c.count > 0)
-    .sort((a, b) => (b.weightedReturn ?? -999) - (a.weightedReturn ?? -999))
-    .slice(0, 4)
-    .map((c) => ({
-      category: c.category,
-      weightedReturn: c.weightedReturn,
-      turnover: c.turnover,
-      count: c.count,
-    }));
+  const hotspots = buildThemeHotspots(active).map((c) => ({
+    theme: c.theme,
+    weightedReturn: c.weightedReturn,
+    turnover: c.turnover,
+    count: c.count,
+  }));
   return {
     totalCount: list.length,
     listedCount: list.filter((x) => x.status === "正常上市").length,
@@ -235,7 +248,8 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
     flat: withPx.filter((x) => (x.changePct ?? 0) === 0).length,
     topGainers: byRet.slice(0, 5),
     topLosers: [...byRet].reverse().slice(0, 5),
-    topTurnover: byTurnover.slice(0, 5),
+    topVolumeUp,
+    topVolumeDown,
     hotspots,
   };
 }
@@ -280,7 +294,9 @@ export async function getMarketPayload(): Promise<MarketPayload> {
     "成交额、份额变化均不等于资金净流入。",
     "已实现跟踪误差暂无法从公开接口获取；如有数字仅为合同目标。",
     "今年涨跌幅取自东方财富 clist f25（年初至今），与日 K 按「上年最后交易日收盘价」计算的结果一致；抽样核验过 f127 并不是今年以来，故未使用。原「近一年涨跌幅」列仍映射 f25，今日市场中会与今年涨跌幅相同。",
-    "管理费率来自 F10 DEC_GUANLIFEI，单位为年费率百分比。",
+    "运作费率 = 管理费率 + 托管费率（F10 DEC_GUANLIFEI + DEC_TUOGUANFEI），单位为年费率百分比；未核实到销售服务费字段，不另加该项。管理费或托管费缺失时运作费率显示为缺失。",
+    "放量上涨/放量下跌榜仅纳入量比≥1.50 的品种，再按涨跌幅排序；量比来自东方财富 clist f10（相对近 5 日同时段均量）。量比缺失或不足 1.50 的不进入榜单，不会用成交额或换手率顶替。上一日收盘快照没有盘中量比，该榜不展示。",
+    "热点主题按跟踪指数、基准和基金名称归入更细主题（如半导体、港股科技、红利），再按成交额加权涨跌幅排序；至少 5 只且能算出加权涨跌幅的主题才进入榜单，不会把「其他主题」算作热点。分类依据公开资料字段，不是官方行业分类。",
   ];
   if (iopvCoverage < list.length) {
     notes.push(`IOPV 缓存覆盖 ${iopvCoverage}/${list.length}，未覆盖品种折溢价显示为缺失，不会用净值或昨收代替。`);
@@ -288,7 +304,6 @@ export async function getMarketPayload(): Promise<MarketPayload> {
   if (f10Coverage < list.length) {
     notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}，缺失资料的品种暂归入「其他」，不会仅按名称强行分类。`);
   }
-
   return {
     source: getMarketProvider().label,
     fetchedAt: Math.floor(quotes.fetchedAt / 1000),

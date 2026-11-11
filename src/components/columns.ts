@@ -18,8 +18,7 @@ export type ColumnKey =
   | "premiumPct"
   | "aum"
   | "ytdChangePct"
-  | "managementFee"
-  | "custodyFee"
+  | "operatingFee"
   | "foundDate"
   | "ret5d"
   | "ret20d"
@@ -46,7 +45,7 @@ export const COLUMNS: ColumnDef[] = [
   { key: "premiumPct", label: "折溢价率", defaultVisible: true, align: "right", numeric: true },
   { key: "aum", label: "基金规模", defaultVisible: true, align: "right", numeric: true },
   { key: "ytdChangePct", label: "今年涨跌幅", defaultVisible: true, align: "right", numeric: true },
-  { key: "managementFee", label: "管理费率", defaultVisible: true, align: "right", numeric: true },
+  { key: "operatingFee", label: "运作费率", defaultVisible: true, align: "right", numeric: true },
   { key: "indexName", label: "跟踪指数", defaultVisible: true },
   { key: "exchange", label: "交易所", defaultVisible: false },
   { key: "category", label: "ETF类型", defaultVisible: false },
@@ -56,7 +55,6 @@ export const COLUMNS: ColumnDef[] = [
   { key: "ask1", label: "卖一价", defaultVisible: false, align: "right", numeric: true },
   { key: "spread", label: "买卖价差", defaultVisible: false, align: "right", numeric: true },
   { key: "iopv", label: "IOPV", defaultVisible: false, align: "right", numeric: true },
-  { key: "custodyFee", label: "托管费率", defaultVisible: false, align: "right", numeric: true },
   { key: "foundDate", label: "基金成立日期", defaultVisible: false },
   { key: "ret5d", label: "近5日涨跌幅", defaultVisible: false, align: "right", numeric: true },
   { key: "ret20d", label: "近20日涨跌幅", defaultVisible: false, align: "right", numeric: true },
@@ -66,3 +64,8 @@ export const COLUMNS: ColumnDef[] = [
 ];
 
 export const DEFAULT_VISIBLE = COLUMNS.filter((c) => c.defaultVisible).map((c) => c.key);
+
+export function columnLabel(key: ColumnKey, view: "today" | "prev"): string {
+  if (view === "prev" && key === "premiumPct") return "收盘溢价率";
+  return COLUMNS.find((c) => c.key === key)?.label ?? key;
+}

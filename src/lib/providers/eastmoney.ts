@@ -1,7 +1,7 @@
 import { extractTrackingErrorTarget } from "../classify";
 import { parseFeePercent, toNum } from "../format";
 import type { FundProfile, IopvSnapshot, KlineBar, TrendPoint } from "../types";
-import type { MarketDataProvider, QuoteRaw } from "./types";
+import type { MarketDataProvider, OfficialNav, QuoteRaw } from "./types";
 
 const PUSH_HOSTS = [
   "https://82.push2.eastmoney.com",
@@ -76,7 +76,7 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function fetchJson(url: string, timeoutMs = 20000): Promise<unknown> {
+async function fetchJson(url: string, timeoutMs = 20000, extraHeaders?: Record<string, string>): Promise<unknown> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -87,6 +87,7 @@ async function fetchJson(url: string, timeoutMs = 20000): Promise<unknown> {
         "User-Agent": UA,
         Referer: "https://quote.eastmoney.com/",
         Accept: "application/json,text/plain,*/*",
+        ...extraHeaders,
       },
     });
     if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
@@ -335,6 +336,27 @@ export class EastMoneyProvider implements MarketDataProvider {
       })
       .filter((b) => Number.isFinite(b.close));
     return { preClose: toNum(payload?.data?.preClose), points };
+  }
+
+  async fetchOfficialNav(code: string, asOfDate: string): Promise<OfficialNav | null> {
+    if (!/^\d{6}$/.test(code) || !/^\d{4}-\d{2}-\d{2}$/.test(asOfDate)) return null;
+    const url = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${encodeURIComponent(code)}&pageIndex=1&pageSize=5&startDate=${encodeURIComponent(asOfDate)}&endDate=${encodeURIComponent(asOfDate)}`;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const payload = (await fetchJson(url, 20000, { Referer: "https://fund.eastmoney.com/" })) as any;
+        const list = (payload?.Data?.LSJZList ?? []) as Record<string, unknown>[];
+        const row = list.find((item) => String(item.FSRQ ?? "").slice(0, 10) === asOfDate);
+        if (!row) return null;
+        const nav = toNum(row.DWJZ);
+        if (nav === null || nav === 0) return null;
+        return { code, date: asOfDate, nav };
+      } catch (err) {
+        lastErr = err;
+        await sleep(200 * (attempt + 1));
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
 }
 

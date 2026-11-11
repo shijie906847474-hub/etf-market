@@ -217,8 +217,7 @@ export function EtfDetail({ code, market }: { code: string; market?: string }) {
               <Info label="基金类型" value={[row.fundType, row.level2Class].filter(Boolean).join(" / ") || "—"} />
               <Info label="跟踪指数" value={row.indexName ?? "—"} />
               <Info label="业绩比较基准" value={row.benchmark ?? "—"} />
-              <Info label="管理费率" value={row.managementFee === null ? "—" : `${row.managementFee.toFixed(2)}%`} />
-              <Info label="托管费率" value={row.custodyFee === null ? "—" : `${row.custodyFee.toFixed(2)}%`} />
+              <Info label="运作费率" value={row.operatingFee === null ? "—" : `${row.operatingFee.toFixed(2)}%`} />
               <Info
                 label="跟踪误差"
                 value={row.trackingErrorTarget ? `${row.trackingErrorTarget}（合同目标，非已实现）` : "暂无已实现跟踪误差，公开 F10 仅可能含合同目标"}

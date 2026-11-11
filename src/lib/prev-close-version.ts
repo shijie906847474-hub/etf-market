@@ -1,0 +1,1 @@
+export const PREV_CLOSE_PAYLOAD_VERSION = 2;

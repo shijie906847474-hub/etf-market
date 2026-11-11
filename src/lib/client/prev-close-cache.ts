@@ -1,6 +1,7 @@
+import { PREV_CLOSE_PAYLOAD_VERSION } from "../prev-close-version";
 import type { MarketPayload } from "../types";
 
-export const PREV_CLOSE_CACHE_KEY = "etf-market-prev-close-v1";
+export const PREV_CLOSE_CACHE_KEY = `etf-market-prev-close-v${PREV_CLOSE_PAYLOAD_VERSION}`;
 
 export interface PrevCloseCacheEntry {
   asOfDate: string;
@@ -11,7 +12,7 @@ export interface PrevCloseCacheEntry {
 
 const DB_NAME = "etf-market";
 const STORE = "snapshots";
-const IDB_KEY = "prev-close";
+const IDB_KEY = `prev-close-v${PREV_CLOSE_PAYLOAD_VERSION}`;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -30,6 +31,7 @@ export function isPrevCloseCacheFresh(entry: PrevCloseCacheEntry | null, shangha
       entry.shanghaiDate === shanghaiDate &&
       entry.asOfDate &&
       entry.payload?.view === "prev-close" &&
+      entry.payload.payloadVersion === PREV_CLOSE_PAYLOAD_VERSION &&
       Array.isArray(entry.payload.list) &&
       entry.payload.list.length > 0,
   );

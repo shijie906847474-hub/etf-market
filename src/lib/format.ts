@@ -91,3 +91,13 @@ export function csvEscape(value: unknown): string {
   if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
+
+/** 运作费率 = 管理费率 + 托管费率；任一项缺失则无法给出完整总费率。销售服务费未接入时按 0。 */
+export function operatingFeeOf(managementFee: number | null, custodyFee: number | null, salesServiceFee: number | null = 0): number | null {
+  if (managementFee === null || custodyFee === null) return null;
+  const sales = salesServiceFee ?? 0;
+  return Number((managementFee + custodyFee + sales).toFixed(4));
+}
+
+/** 量比达到该阈值视为明显放大，用于放量上涨/下跌榜。 */
+export const VOLUME_RATIO_SURGE = 1.5;

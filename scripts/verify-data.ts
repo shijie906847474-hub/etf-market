@@ -64,6 +64,39 @@ async function main() {
         q?.ytdChangePct != null && ytdLive != null ? Math.abs(q.ytdChangePct - ytdLive) < 0.08 : null,
     });
   }
+
+  const anchorBars = await p.fetchKline("1.510300", 101, 20);
+  const todayStr = shanghaiDateString();
+  const prevBar = [...anchorBars].reverse().find((b) => b.time < todayStr);
+  const asOf = prevBar?.time;
+  if (!asOf) {
+    console.log("PREV_NAV_CHECK_SKIP", "unable to resolve previous session");
+  } else {
+    const navChecks = [
+      { secid: "1.510300", code: "510300" },
+      { secid: "0.159915", code: "159915" },
+      { secid: "1.513100", code: "513100" },
+      { secid: "1.513390", code: "513390" },
+    ];
+    for (const item of navChecks) {
+      const bars = await p.fetchKline(item.secid, 101, 20);
+      const bar = bars.find((b) => b.time === asOf);
+      const official = await p.fetchOfficialNav(item.code, asOf);
+      const close = bar && Number.isFinite(bar.close) ? bar.close : null;
+      const nav = official?.nav ?? null;
+      const premium =
+        close !== null && nav !== null && nav !== 0 ? ((close - nav) / nav) * 100 : null;
+      console.log("PREV_NAV_CHECK", {
+        code: item.code,
+        asOfDate: asOf,
+        close,
+        nav,
+        navDate: official?.date ?? null,
+        premiumPct: premium,
+        reason: premium === null ? (nav === null ? "no same-date official NAV (lsjz DWJZ)" : "no valid close") : null,
+      });
+    }
+  }
 }
 
 main().catch((err) => {

@@ -2,21 +2,32 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { COLUMNS, DEFAULT_VISIBLE, type ColumnKey } from "@/components/columns";
+import { COLUMNS, DEFAULT_VISIBLE, columnLabel, type ColumnKey } from "@/components/columns";
 import { isPrevCloseCacheFresh, readPrevCloseCache, writePrevCloseCache } from "@/lib/client/prev-close-cache";
-import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands } from "@/lib/format";
+import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands, VOLUME_RATIO_SURGE } from "@/lib/format";
 import { shanghaiDateString } from "@/lib/market-hours";
+import { buildThemeHotspots, classifyTheme, THEME_MIN_COUNT } from "@/lib/themes";
 import type { EtfCategory, EtfRow, MarketPayload } from "@/lib/types";
 import { ALL_CATEGORIES } from "@/lib/types";
 import { isWatched, loadWatchlist, saveWatchlist, toggleWatch, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
 
 type MarketView = "today" | "prev";
-const COLUMN_STORE_KEY = "etf-market-columns-v2";
-const COLUMN_STORE_LEGACY = "etf-market-columns-v1";
+const COLUMN_STORE_KEY = "etf-market-columns-v3";
+const COLUMN_STORE_LEGACY = ["etf-market-columns-v2", "etf-market-columns-v1"];
 
-function migrateVisible(saved: ColumnKey[]): ColumnKey[] {
-  const next = [...saved];
+const COLUMN_KEYS = new Set<string>(COLUMNS.map((c) => c.key));
+
+function migrateVisible(saved: string[]): ColumnKey[] {
+  const next: ColumnKey[] = [];
+  for (const key of saved) {
+    if (key === "managementFee") {
+      if (!next.includes("operatingFee")) next.push("operatingFee");
+      continue;
+    }
+    if (key === "custodyFee") continue;
+    if (COLUMN_KEYS.has(key) && !next.includes(key as ColumnKey)) next.push(key as ColumnKey);
+  }
   const insertAfter = (key: ColumnKey, after: ColumnKey) => {
     if (next.includes(key)) return;
     const i = next.indexOf(after);
@@ -24,17 +35,18 @@ function migrateVisible(saved: ColumnKey[]): ColumnKey[] {
     else next.push(key);
   };
   insertAfter("ytdChangePct", "aum");
-  insertAfter("managementFee", "ytdChangePct");
+  insertAfter("operatingFee", "ytdChangePct");
   return next;
 }
 
 function loadVisibleColumns(): ColumnKey[] {
   try {
-    const v2 = localStorage.getItem(COLUMN_STORE_KEY);
-    if (v2) return JSON.parse(v2) as ColumnKey[];
-    const v1 = localStorage.getItem(COLUMN_STORE_LEGACY);
-    if (v1) {
-      const migrated = migrateVisible(JSON.parse(v1) as ColumnKey[]);
+    const current = localStorage.getItem(COLUMN_STORE_KEY);
+    if (current) return migrateVisible(JSON.parse(current) as string[]);
+    for (const key of COLUMN_STORE_LEGACY) {
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const migrated = migrateVisible(JSON.parse(raw) as string[]);
       localStorage.setItem(COLUMN_STORE_KEY, JSON.stringify(migrated));
       return migrated;
     }
@@ -65,6 +77,8 @@ interface Filters {
   volumeRatioMax: string;
   feeMin: string;
   feeMax: string;
+  indexQuery: string;
+  theme: string;
 }
 
 const EMPTY_FILTERS: Filters = {
@@ -86,6 +100,8 @@ const EMPTY_FILTERS: Filters = {
   volumeRatioMax: "",
   feeMin: "",
   feeMax: "",
+  indexQuery: "",
+  theme: "",
 };
 
 function numOrNull(s: string): number | null {
@@ -182,10 +198,8 @@ function cellValue(row: EtfRow, key: ColumnKey): string {
       return formatAum(row.aum);
     case "ytdChangePct":
       return formatPct(row.ytdChangePct);
-    case "managementFee":
-      return row.managementFee === null ? "—" : `${row.managementFee.toFixed(2)}%`;
-    case "custodyFee":
-      return row.custodyFee === null ? "—" : `${row.custodyFee.toFixed(2)}%`;
+    case "operatingFee":
+      return row.operatingFee === null ? "—" : `${row.operatingFee.toFixed(2)}%`;
     case "foundDate":
       return formatDateOnly(row.foundDate);
     case "ret5d":
@@ -310,13 +324,22 @@ export function MarketTerminal() {
     setPage(1);
   };
 
+  const themeHotspots = useMemo(() => (data ? buildThemeHotspots(data.list) : []), [data]);
+
   const filtered = useMemo(() => {
     if (!data) return [];
     const q = filters.search.trim().toLowerCase();
     return data.list.filter((row) => {
       if (row.status === "终止上市") return false;
       if (filters.category !== "全部" && row.category !== filters.category) return false;
+      if (filters.theme && classifyTheme(row) !== filters.theme) return false;
       if (q && !row.code.includes(q) && !row.name.toLowerCase().includes(q)) return false;
+      const idx = filters.indexQuery.trim().toLowerCase();
+      if (idx) {
+        const indexName = (row.indexName ?? "").toLowerCase();
+        const indexCode = (row.indexCode ?? "").toLowerCase();
+        if (!indexName.includes(idx) && !indexCode.includes(idx)) return false;
+      }
       if (!matchChange(row.changePct, filters.changeBucket)) return false;
       if (!matchPremium(row.premiumPct, filters.premiumBucket)) return false;
       if (!inRange(row.turnover === null ? null : row.turnover / 1e4, numOrNull(filters.turnoverMin), numOrNull(filters.turnoverMax)))
@@ -326,7 +349,7 @@ export function MarketTerminal() {
       if (!inRange(row.ret20d, numOrNull(filters.ret20Min), numOrNull(filters.ret20Max))) return false;
       if (!inRange(row.turnoverRate, numOrNull(filters.turnoverRateMin), numOrNull(filters.turnoverRateMax))) return false;
       if (!inRange(row.volumeRatio, numOrNull(filters.volumeRatioMin), numOrNull(filters.volumeRatioMax))) return false;
-      if (!inRange(row.managementFee, numOrNull(filters.feeMin), numOrNull(filters.feeMax))) return false;
+      if (!inRange(row.operatingFee, numOrNull(filters.feeMin), numOrNull(filters.feeMax))) return false;
       return true;
     });
   }, [data, filters]);
@@ -359,7 +382,7 @@ export function MarketTerminal() {
 
   const exportCsv = () => {
     const cols = COLUMNS.filter((c) => visible.includes(c.key));
-    const header = cols.map((c) => csvEscape(c.label)).join(",");
+    const header = cols.map((c) => csvEscape(columnLabel(c.key, view))).join(",");
     const lines = sorted.map((row) => cols.map((c) => csvEscape(cellValue(row, c.key))).join(","));
     const blob = new Blob(["\uFEFF" + [header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -427,7 +450,7 @@ export function MarketTerminal() {
           {view === "prev" ? (
             <>
               <span>收盘日期 {data?.asOfDate ?? "—"}</span>
-              <span>上一交易日收盘（本地缓存，非实时行情）</span>
+              <span>上一交易日收盘（本地缓存，非实时行情）· 收盘溢价（净值）</span>
             </>
           ) : (
             <>
@@ -440,7 +463,7 @@ export function MarketTerminal() {
           {data ? (
             <span>
               {view === "prev"
-                ? `资料覆盖 ${data.f10Coverage}/${data.list.length} · 折溢价/IOPV 不适用于收盘快照`
+                ? `资料覆盖 ${data.f10Coverage}/${data.list.length} · 净值覆盖 ${data.navCoverage ?? 0}/${data.list.length}`
                 : `资料覆盖 ${data.f10Coverage}/${data.list.length} · IOPV 覆盖 ${data.iopvCoverage}/${data.list.length}`}
             </span>
           ) : null}
@@ -484,26 +507,61 @@ export function MarketTerminal() {
             </div>
           </section>
 
-          <section className="grid grid-cols-1 gap-0 border-b border-terminal-border lg:grid-cols-4">
+          <section className="grid grid-cols-1 gap-0 border-b border-terminal-border lg:grid-cols-5">
             <RankList title="涨幅榜 TOP 5" rows={ov.topGainers} field="changePct" />
             <RankList title="跌幅榜 TOP 5" rows={ov.topLosers} field="changePct" />
-            <RankList title="成交额榜 TOP 5" rows={ov.topTurnover} field="turnover" />
+            {view === "today" ? (
+              <>
+                <RankList
+                  title="放量上涨 TOP 5"
+                  subtitle={`量比≥${VOLUME_RATIO_SURGE.toFixed(2)}`}
+                  rows={ov.topVolumeUp ?? []}
+                  field="changePct"
+                  showVolumeRatio
+                  emptyText={`暂无量比≥${VOLUME_RATIO_SURGE.toFixed(2)} 的上涨品种`}
+                />
+                <RankList
+                  title="放量下跌 TOP 5"
+                  subtitle={`量比≥${VOLUME_RATIO_SURGE.toFixed(2)}`}
+                  rows={ov.topVolumeDown ?? []}
+                  field="changePct"
+                  showVolumeRatio
+                  emptyText={`暂无量比≥${VOLUME_RATIO_SURGE.toFixed(2)} 的下跌品种`}
+                />
+              </>
+            ) : (
+              <div className="border-r border-terminal-border px-3 py-2 lg:col-span-2">
+                <div className="mb-1 text-[12px] text-terminal-muted">放量上涨 / 放量下跌</div>
+                <div className="text-[11px] leading-relaxed text-terminal-muted">
+                  该榜依赖盘中量比（相对近 5 日同时段均量），上一日收盘快照没有这一字段，因此不展示。
+                </div>
+              </div>
+            )}
             <div className="border-r border-terminal-border last:border-r-0 px-3 py-2">
-              <div className="mb-1 text-[12px] text-terminal-muted">{view === "prev" ? "收盘日市场热点分类" : "当日市场热点分类"}</div>
-              <div className="text-[10px] text-terminal-muted mb-1">按分类成交额加权涨跌幅排序</div>
-              {ov.hotspots.map((h) => (
-                <button
-                  key={h.category}
-                  type="button"
-                  onClick={() => updateFilter("category", h.category)}
-                  className="flex w-full items-center justify-between py-0.5 text-left text-sm hover:bg-white/5"
-                >
-                  <span>
-                    {h.category} <span className="text-[11px] text-terminal-muted">{h.count}只</span>
-                  </span>
-                  <span className={cn("font-mono", changeClass(h.weightedReturn))}>{formatPct(h.weightedReturn)}</span>
-                </button>
-              ))}
+              <div className="mb-1 text-[12px] text-terminal-muted">{view === "prev" ? "收盘日热点主题" : "当日热点主题"}</div>
+              <div className="text-[10px] text-terminal-muted mb-1">
+                按跟踪指数归类，成交额加权涨跌幅；至少 {THEME_MIN_COUNT} 只
+              </div>
+              {themeHotspots.length === 0 ? (
+                <div className="text-[11px] leading-relaxed text-terminal-muted">暂无满足只数要求的主题</div>
+              ) : (
+                themeHotspots.map((h) => (
+                  <button
+                    key={h.theme}
+                    type="button"
+                    onClick={() => updateFilter("theme", filters.theme === h.theme ? "" : h.theme)}
+                    className={cn(
+                      "flex w-full items-center justify-between py-0.5 text-left text-sm hover:bg-white/5",
+                      filters.theme === h.theme && "bg-white/10",
+                    )}
+                  >
+                    <span>
+                      {h.theme} <span className="text-[11px] text-terminal-muted">{h.count}只</span>
+                    </span>
+                    <span className={cn("font-mono", changeClass(h.weightedReturn))}>{formatPct(h.weightedReturn)}</span>
+                  </button>
+                ))
+              )}
             </div>
           </section>
 
@@ -548,7 +606,25 @@ export function MarketTerminal() {
               className="h-8 w-40 border border-terminal-border bg-terminal-panel px-2 font-mono text-sm"
             />
           </label>
+          <label className="text-xs">
+            <span className="mb-1 block text-terminal-muted">跟踪指数</span>
+            <input
+              value={filters.indexQuery}
+              onChange={(e) => updateFilter("indexQuery", e.target.value)}
+              placeholder="名称或代码"
+              className="h-8 w-40 border border-terminal-border bg-terminal-panel px-2 font-mono text-sm"
+            />
+          </label>
           <Select label="类型" value={filters.category} onChange={(v) => updateFilter("category", v as Filters["category"])} options={["全部", ...ALL_CATEGORIES]} />
+          {filters.theme ? (
+            <button
+              type="button"
+              onClick={() => updateFilter("theme", "")}
+              className="h-8 border border-terminal-border px-2 text-xs hover:bg-white/5"
+            >
+              主题：{filters.theme} ×
+            </button>
+          ) : null}
           <Select
             label="涨跌幅"
             value={filters.changeBucket}
@@ -564,7 +640,7 @@ export function MarketTerminal() {
             ]}
           />
           <Select
-            label="折溢价"
+            label={view === "prev" ? "收盘溢价" : "折溢价"}
             value={filters.premiumBucket}
             onChange={(v) => updateFilter("premiumBucket", v)}
             options={[
@@ -582,7 +658,7 @@ export function MarketTerminal() {
           <Range label="近20日涨幅%" a={filters.ret20Min} b={filters.ret20Max} onA={(v) => updateFilter("ret20Min", v)} onB={(v) => updateFilter("ret20Max", v)} />
           <Range label="换手率%" a={filters.turnoverRateMin} b={filters.turnoverRateMax} onA={(v) => updateFilter("turnoverRateMin", v)} onB={(v) => updateFilter("turnoverRateMax", v)} />
           <Range label="量比" a={filters.volumeRatioMin} b={filters.volumeRatioMax} onA={(v) => updateFilter("volumeRatioMin", v)} onB={(v) => updateFilter("volumeRatioMax", v)} />
-          <Range label="管理费率%" a={filters.feeMin} b={filters.feeMax} onA={(v) => updateFilter("feeMin", v)} onB={(v) => updateFilter("feeMax", v)} />
+          <Range label="运作费率%" a={filters.feeMin} b={filters.feeMax} onA={(v) => updateFilter("feeMin", v)} onB={(v) => updateFilter("feeMax", v)} />
           <button
             type="button"
             onClick={() => {
@@ -609,7 +685,7 @@ export function MarketTerminal() {
                         if (next.length) persistCols(next);
                       }}
                     />
-                    {c.label}
+                    {columnLabel(c.key, view)}
                   </label>
                 ))}
               </div>
@@ -644,7 +720,7 @@ export function MarketTerminal() {
             </select>
           </label>
         </div>
-        <div className="max-h-[70vh] overflow-auto">
+        <div>
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10 bg-terminal-header">
               <tr>
@@ -658,8 +734,11 @@ export function MarketTerminal() {
                       c.align === "right" ? "text-right" : "text-left",
                     )}
                   >
-                    {c.label}
+                    {columnLabel(c.key, view)}
                     {sortKey === c.key ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+                    {c.key === "premiumPct" && view === "prev" ? (
+                      <span className="ml-1 text-[10px] font-normal text-terminal-muted">净值</span>
+                    ) : null}
                   </th>
                 ))}
               </tr>
@@ -731,18 +810,37 @@ export function MarketTerminal() {
   );
 }
 
-function RankList({ title, rows, field }: { title: string; rows: EtfRow[]; field: "changePct" | "turnover" }) {
+function RankList({
+  title,
+  subtitle,
+  rows,
+  field,
+  showVolumeRatio,
+  emptyText,
+}: {
+  title: string;
+  subtitle?: string;
+  rows: EtfRow[];
+  field: "changePct" | "turnover";
+  showVolumeRatio?: boolean;
+  emptyText?: string;
+}) {
   return (
     <div className="border-r border-terminal-border px-3 py-2 last:border-r-0">
       <div className="mb-1 text-[12px] text-terminal-muted">{title}</div>
+      {subtitle ? <div className="mb-1 text-[10px] text-terminal-muted">{subtitle}</div> : null}
+      {rows.length === 0 && emptyText ? (
+        <div className="py-1 text-[11px] text-terminal-muted">{emptyText}</div>
+      ) : null}
       {rows.map((row, i) => (
         <Link key={row.code} href={`/etf/${row.code}?market=${row.market}`} className="flex items-center justify-between py-0.5 text-sm hover:bg-white/5">
           <span className="truncate">
             <span className="mr-2 font-mono text-terminal-muted">{i + 1}</span>
             {row.name}
           </span>
-          <span className={cn("ml-2 font-mono", field === "changePct" ? changeClass(row.changePct) : "text-terminal-text")}>
+          <span className={cn("ml-2 shrink-0 font-mono", field === "changePct" ? changeClass(row.changePct) : "text-terminal-text")}>
             {field === "changePct" ? formatPct(row.changePct) : formatMoney(row.turnover)}
+            {showVolumeRatio ? <span className="ml-2 text-[10px] text-terminal-muted">{formatNumber(row.volumeRatio, 2)}</span> : null}
           </span>
         </Link>
       ))}
