@@ -1,7 +1,7 @@
 import { memoryGet, memorySet, readJsonFile, writeJsonFile } from "../cache";
 import { classifyEtf, detectStatus } from "../classify";
 import { buildThemeHotspots } from "../themes";
-import { listedDateFromF26, operatingFeeOf, premiumFromNav, VOLUME_RATIO_SURGE } from "../format";
+import { alignOfficialNav, isMoneyMarketFund, listedDateFromF26, operatingFeeOf, premiumFromNav, VOLUME_RATIO_SURGE } from "../format";
 import { marketFreshness, shanghaiDateString } from "../market-hours";
 import { getMarketProvider } from "../providers";
 import type {
@@ -70,6 +70,11 @@ export function mergeRow(
   const category = classifyEtf(f10 ?? null);
   const spread =
     q.ask1 !== null && q.bid1 !== null ? Number((q.ask1 - q.bid1).toFixed(6)) : null;
+  const nav = alignOfficialNav(
+    officialNav?.nav ?? null,
+    last,
+    isMoneyMarketFund({ category, fundType: f10?.fundType ?? null }),
+  );
   return {
     code: q.code,
     name: q.name,
@@ -94,9 +99,9 @@ export function mergeRow(
     ask1: q.ask1,
     spread,
     iopv: iopv?.iopv ?? null,
-    nav: officialNav?.nav ?? null,
+    nav,
     navDate: officialNav?.date ?? null,
-    premiumPct: premiumFromNav(last, officialNav?.nav ?? null),
+    premiumPct: premiumFromNav(last, nav),
     listedDate: listedDateFromF26(q.listedDateRaw),
     quoteTime: q.quoteTime,
     ret5d: q.ret5d,
@@ -400,7 +405,7 @@ function buildLivePayload(quotes: { quotes: import("../providers/types").QuoteRa
   const notes = [
     "数据来源为东方财富公开行情，不是交易所官方实时馈送。",
     "基金规模取自 F10 NEW_SCALE，并标注披露日；不是现价×份额。",
-    "折溢价 = (最新价 − 最新公布的基金份额净值) / 净值 × 100，与常见券商软件口径一致。净值取自东方财富基金历史净值接口 lsjz 的最新一条 DWJZ，并标注净值日期；不会用 IOPV、stock/get 的 f131、昨收或估值填补。",
+    "折溢价 = (最新价 − 最新公布的基金份额净值) / 净值 × 100，与常见券商软件口径一致。净值取自东方财富基金历史净值接口 lsjz 的最新一条 DWJZ，并标注净值日期；不会用 IOPV、stock/get 的 f131、昨收或估值填补。收益结转型货币基金的 lsjz DWJZ 实际是每万份收益，不能直接与市价相比；这类基金官方单位净值恒为 1.00 元，折溢价按与市价相同的报价单位对齐（二级市场通常为每百份 100 元）。净值型货币（如银华日利）仍直接使用公布的单位净值。",
     "跨境/QDII 净值常滞后 1–2 个交易日，此时折溢价反映的是市价相对已公布净值的偏离，不是相对盘中 IOPV 的偏离。IOPV 仍单独展示，不参与折溢价。",
     "成交额、份额变化均不等于资金净流入。",
     "已实现跟踪误差暂无法从公开接口获取；如有数字仅为合同目标。",

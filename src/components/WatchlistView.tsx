@@ -1,37 +1,73 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { changeClass, formatMoney, formatPct, formatPrice, formatShanghai, lastPriceLabel } from "@/lib/format";
 import type { EtfRow, MarketPayload } from "@/lib/types";
 import { loadWatchlist, saveWatchlist, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
+import { readLiveMarketCache, writeLiveMarketCache } from "@/lib/client/live-market-cache";
+import { useRefreshInterval } from "@/lib/client/refresh-interval";
 
 export function WatchlistView() {
   const [groups, setGroups] = useState<WatchGroup[]>([]);
   const [active, setActive] = useState("default");
   const [data, setData] = useState<MarketPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [newName, setNewName] = useState("");
+  const [refreshIntervalMs] = useRefreshInterval();
+  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
+  const [nowTick, setNowTick] = useState(0);
+  const headerRef = useRef<HTMLElement>(null);
+  const [headerOffset, setHeaderOffset] = useState(0);
+
+  useLayoutEffect(() => {
+    const cached = readLiveMarketCache();
+    if (cached) setData(cached);
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const update = () => setHeaderOffset(el.getBoundingClientRect().height);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setNowTick(Date.now());
+    const id = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     setGroups(loadWatchlist());
-    (async () => {
+    const apply = (json: MarketPayload) => {
+      setData(json);
+      writeLiveMarketCache(json);
+    };
+    const load = async (silent: boolean) => {
+      if (silent) setRefreshing(true);
       try {
         const res = await fetch("/api/market", { cache: "no-store" });
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "行情加载失败");
-        setData(json);
+        apply(json);
+        setError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "行情加载失败");
+        if (!silent) setError(err instanceof Error ? err.message : "行情加载失败");
+      } finally {
+        setRefreshing(false);
+        setNextRefreshAt(Date.now() + refreshIntervalMs);
       }
-    })();
-    const id = window.setInterval(async () => {
-      const res = await fetch("/api/market", { cache: "no-store" });
-      if (res.ok) setData(await res.json());
-    }, 15000);
+    };
+    void load(Boolean(readLiveMarketCache()));
+    const id = window.setInterval(() => void load(true), refreshIntervalMs);
     return () => window.clearInterval(id);
-  }, []);
+  }, [refreshIntervalMs]);
 
   const persist = (next: WatchGroup[]) => {
     setGroups(next);
@@ -47,7 +83,7 @@ export function WatchlistView() {
   const group = groups.find((g) => g.id === active) ?? groups[0];
   return (
     <div className="min-h-screen">
-      <header className="border-b border-terminal-border bg-terminal-header px-3 py-2">
+      <header ref={headerRef} className="sticky top-0 z-30 border-b border-terminal-border bg-terminal-header px-3 py-2">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <Link href="/" className="text-sm text-terminal-muted hover:text-terminal-text">
@@ -57,6 +93,11 @@ export function WatchlistView() {
           </div>
           <div className="text-[11px] text-terminal-muted">
             本地保存，无需登录 · 数据来源：{data?.source ?? "东方财富公开行情"} · {formatShanghai(data?.quoteTime ?? null)}
+            {refreshing
+              ? " · 正在刷新"
+              : nextRefreshAt != null
+                ? ` · 刷新倒计时 ${Math.max(0, Math.ceil((nextRefreshAt - (nowTick || Date.now())) / 1000))} 秒`
+                : ""}
           </div>
         </div>
       </header>
@@ -109,17 +150,22 @@ export function WatchlistView() {
         ) : null}
       </section>
 
-      <div className="overflow-auto">
-        <table className="min-w-full text-sm">
-          <thead className="sticky top-0 bg-terminal-header">
+      <div>
+        <table className="min-w-full border-separate border-spacing-0 text-sm">
+          <thead>
             <tr className="text-left text-terminal-muted">
-              <th className="px-2 py-1">排序</th>
-              <th className="px-2 py-1">代码</th>
-              <th className="px-2 py-1">名称</th>
-              <th className="px-2 py-1 text-right">最新价</th>
-              <th className="px-2 py-1 text-right">涨跌幅</th>
-              <th className="px-2 py-1 text-right">成交额</th>
-              <th className="px-2 py-1">操作</th>
+              {["排序", "代码", "名称", "最新价", "涨跌幅", "成交额", "操作"].map((label) => (
+                <th
+                  key={label}
+                  className={cn(
+                    "sticky z-20 border-b border-terminal-border bg-terminal-header px-2 py-1",
+                    (label === "最新价" || label === "涨跌幅" || label === "成交额") && "text-right",
+                  )}
+                  style={{ top: headerOffset }}
+                >
+                  {label}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
@@ -160,23 +206,9 @@ export function WatchlistView() {
                       ↓
                     </button>
                   </td>
-                  <td className="px-2 py-1 font-mono">
-                    {row ? (
-                      <Link href={`/etf/${row.code}?market=${row.market}`} className="hover:underline">
-                        {code}
-                      </Link>
-                    ) : (
-                      code
-                    )}
-                  </td>
+                  <td className="px-2 py-1 font-mono">{code}</td>
                   <td className="px-2 py-1">
-                    {row ? (
-                      <Link href={`/etf/${row.code}?market=${row.market}`} className="hover:underline">
-                        {row.name}
-                      </Link>
-                    ) : (
-                      <span className="text-terminal-muted">{data ? "清单中未找到" : "行情加载中"}</span>
-                    )}
+                    {row ? row.name : <span className="text-terminal-muted">{data ? "清单中未找到" : "行情加载中"}</span>}
                   </td>
                   <td
                     className={cn(

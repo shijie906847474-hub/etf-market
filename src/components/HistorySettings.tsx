@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { formatShanghai } from "@/lib/format";
-import { deleteAllClientHistoryCache, deleteClientHistoryCache } from "@/lib/client/prev-close-cache";
+import { deleteAllClientHistoryCache, deleteClientHistoryCache, listClientHistoryCache } from "@/lib/client/prev-close-cache";
 import type { HistoryCacheItem } from "@/lib/types";
+import { REFRESH_INTERVAL_OPTIONS, useRefreshInterval } from "@/lib/client/refresh-interval";
 
 function formatSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "—";
@@ -12,7 +13,25 @@ function formatSize(bytes: number): string {
   return `${bytes} B`;
 }
 
+
+function mergeCacheItems(groups: HistoryCacheItem[][]): HistoryCacheItem[] {
+  const items = new Map<string, HistoryCacheItem>();
+  for (const group of groups) {
+    for (const item of group) {
+      const prev = items.get(item.date);
+      items.set(item.date, {
+        date: item.date,
+        etfCount: Math.max(prev?.etfCount ?? 0, item.etfCount),
+        savedAt: Math.max(prev?.savedAt ?? 0, item.savedAt),
+        sizeBytes: Math.max(prev?.sizeBytes ?? 0, item.sizeBytes),
+      });
+    }
+  }
+  return [...items.values()].sort((a, b) => b.date.localeCompare(a.date));
+}
+
 export function HistorySettings() {
+  const [refreshIntervalMs, setRefreshIntervalMs] = useRefreshInterval();
   const [items, setItems] = useState<HistoryCacheItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -24,10 +43,16 @@ export function HistorySettings() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/history/cache", { cache: "no-store" });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error || "无法读取历史缓存");
-      setItems(Array.isArray(body.items) ? body.items : []);
+      const clientItems = await listClientHistoryCache().catch(() => [] as HistoryCacheItem[]);
+      let serverItems: HistoryCacheItem[] = [];
+      try {
+        const res = await fetch("/api/history/cache", { cache: "no-store" });
+        const body = await res.json();
+        if (res.ok && Array.isArray(body.items)) serverItems = body.items as HistoryCacheItem[];
+      } catch {
+        /* Vercel 等环境可能没有可读的服务端文件缓存 */
+      }
+      setItems(mergeCacheItems([clientItems, serverItems]));
       setSelected(new Set());
       setConfirmAll(false);
     } catch (err) {
@@ -59,10 +84,17 @@ export function HistorySettings() {
     setError(null);
     try {
       for (const date of dates) {
-        const res = await fetch(`/api/history/cache?date=${encodeURIComponent(date)}`, { method: "DELETE" });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(body.error || `删除 ${date} 失败`);
         await deleteClientHistoryCache(date);
+        try {
+          const res = await fetch(`/api/history/cache?date=${encodeURIComponent(date)}`, { method: "DELETE" });
+          if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            throw new Error(body.error || `删除 ${date} 失败`);
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.includes("删除")) throw err;
+          /* 服务端没有该日期时忽略 */
+        }
       }
       await load();
     } catch (err) {
@@ -79,10 +111,17 @@ export function HistorySettings() {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/history/cache?all=1", { method: "DELETE" });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error || "全部删除失败");
       await deleteAllClientHistoryCache();
+      try {
+        const res = await fetch("/api/history/cache?all=1", { method: "DELETE" });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || "全部删除失败");
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message === "全部删除失败") throw err;
+        /* 服务端没有可删文件时忽略 */
+      }
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "全部删除失败");
@@ -92,9 +131,28 @@ export function HistorySettings() {
 
   return (
     <section className="px-3 py-4">
-      <h2 className="text-sm font-medium">历史行情缓存</h2>
+      <h2 className="text-sm font-medium">行情刷新</h2>
       <p className="mt-1 max-w-3xl text-xs leading-relaxed text-terminal-muted">
-        在「历史市场」里选过的交易日，收盘行情会下载并保存在服务端本地，同一天再次打开会直接读取，不用重新拉日 K。下面列出当前服务端已缓存的日期，可勾选删除，或一次性全部清除。若部署环境没有持久磁盘，进程重启后可能需要重新下载。
+        仅对「今日市场」和「我的自选」生效。历史市场是收盘快照，不会自动刷新。间隔保存在本机浏览器中。
+      </p>
+      <label className="mt-3 flex items-center gap-2 text-xs">
+        <span className="text-terminal-muted">自动刷新间隔</span>
+        <select
+          value={refreshIntervalMs}
+          onChange={(e) => setRefreshIntervalMs(Number(e.target.value))}
+          className="h-8 border border-terminal-border bg-terminal-panel px-2 text-sm"
+        >
+          {REFRESH_INTERVAL_OPTIONS.map((opt) => (
+            <option key={opt.ms} value={opt.ms}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <h2 className="mt-8 text-sm font-medium">历史行情缓存</h2>
+      <p className="mt-1 max-w-3xl text-xs leading-relaxed text-terminal-muted">
+        在「历史市场」里选过的交易日，收盘行情会保存在本机浏览器中，同一天再次打开会直接读取，不用重新拉日 K。下面列出已缓存的日期，可勾选删除，或一次性全部清除。服务端文件缓存只在有持久磁盘的环境生效；当前线上部署没有持久磁盘，因此以本机缓存为准。
       </p>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <button
@@ -124,7 +182,7 @@ export function HistorySettings() {
       </div>
       {error ? <div className="mt-3 text-sm text-up">操作失败：{error}</div> : null}
       {loading ? (
-        <div className="mt-6 text-sm text-terminal-muted">正在读取服务端缓存…</div>
+        <div className="mt-6 text-sm text-terminal-muted">正在读取缓存…</div>
       ) : items.length === 0 ? (
         <div className="mt-6 text-sm text-terminal-muted">暂无已缓存的历史行情。到「历史市场」选择一个交易日后，这里会出现对应日期。</div>
       ) : (

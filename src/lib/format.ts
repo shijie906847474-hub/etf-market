@@ -110,6 +110,31 @@ export function premiumFromNav(price: number | null, nav: number | null): number
   return ((price - nav) / nav) * 100;
 }
 
+export function isMoneyMarketFund(row: { category?: string | null; fundType?: string | null }): boolean {
+  return row.category === "货币" || (row.fundType ?? "").includes("货币");
+}
+
+/**
+ * 收益结转型货币基金在东方财富 lsjz 里，DWJZ 实际是每万份收益（约 0.2–1 元），不是基金份额净值。
+ * 这类基金官方单位净值恒为 1.00 元，二级市场通常按每百份报价（约 100 元）。
+ * 净值型货币（如银华日利）的 DWJZ 已是可与市价比较的单位净值，保持原值。
+ * 只做官方单位净值与报价单位对齐，不会用 IOPV 或 f131。
+ */
+export function alignOfficialNav(
+  publishedNav: number | null,
+  price: number | null,
+  moneyFund: boolean,
+): number | null {
+  if (publishedNav === null || publishedNav <= 0) return null;
+  if (!moneyFund || price === null || price <= 0) return publishedNav;
+  const rawAbs = Math.abs(price - publishedNav) / publishedNav;
+  if (rawAbs < 0.5) return publishedNav;
+  if (publishedNav >= 10) return publishedNav;
+  const unitNav = 1;
+  const perHundred = 100 * unitNav;
+  return Math.abs(price - perHundred) <= Math.abs(price - unitNav) ? perHundred : unitNav;
+}
+
 
 export function lastPriceLabel(row: { status: TradeStatus; last: number | null }): string {
   if (row.status === "停牌") return row.last == null ? "停牌" : `${formatPrice(row.last)} 停牌`;

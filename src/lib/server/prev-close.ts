@@ -1,5 +1,6 @@
 import { deleteCacheFile, listCacheFiles, memoryDelete, memoryDeleteByPrefix, memoryGet, memorySet, readJsonFile, writeJsonFile } from "../cache";
 import { PREV_CLOSE_PAYLOAD_VERSION } from "../prev-close-version";
+import { alignOfficialNav, isMoneyMarketFund } from "../format";
 import { shanghaiDateString, shanghaiSessionCloseUnix } from "../market-hours";
 import { getMarketProvider } from "../providers";
 import type { QuoteRaw } from "../providers/types";
@@ -202,7 +203,8 @@ async function buildPrevClosePayload(asOfDate: string, klineLimit: number, onPro
 
   const list = quotes.map(({ q, officialNav }) => {
     const row = mergeRow(q, getCachedF10(q.code), undefined);
-    const nav = officialNav && officialNav.date === asOfDate ? officialNav.nav : null;
+    const published = officialNav && officialNav.date === asOfDate ? officialNav.nav : null;
+    const nav = alignOfficialNav(published, row.last, isMoneyMarketFund(row));
     const premium = closePremiumFromNav(row.last, nav);
     if (premium === null) {
       row.nav = null;
@@ -221,7 +223,7 @@ async function buildPrevClosePayload(asOfDate: string, klineLimit: number, onPro
     `「历史市场」展示 ${asOfDate} 这一完整交易日的收盘行情，不是今天的实时报价。`,
     "可选日期为沪深300ETF（510300）日 K 中早于上海日历当天的交易日，会跳过周末与节假日，也不会把尚未收盘的今天当作历史行情。",
     "价格、涨跌、成交额/量、换手、开高低取自该日 K 线；昨收为再前一交易日收盘价。买卖一档、价差、量比、IOPV 为盘中字段，收盘快照中显示为缺失。",
-    "收盘溢价率（净值）= (该日收盘价 − 当日基金份额净值) / 当日净值 × 100。净值取自东方财富基金历史净值接口 lsjz 的 DWJZ，且必须 FSRQ 等于该收盘日；不会用更早的净值、IOPV、昨收或估值去填补。",
+    "收盘溢价率（净值）= (该日收盘价 − 当日基金份额净值) / 当日净值 × 100。净值取自东方财富基金历史净值接口 lsjz 的 DWJZ，且必须 FSRQ 等于该收盘日；不会用更早的净值、IOPV、昨收或估值去填补。收益结转型货币基金的 lsjz DWJZ 是每万份收益，收盘溢价改按官方单位净值 1.00 元对齐到与收盘价相同的报价单位（通常为每百份 100 元）；净值型货币仍用当日公布的单位净值。",
     "当日净值尚未公布的品种（跨境/QDII 常见为 T+1 才披露）收盘溢价显示为 —。今日市场的折溢价改用最新已公布净值，口径与常见券商一致，但也必须标注净值日期。",
     "今年涨跌幅按该日收盘价相对上一自然年最后交易日收盘价计算：(收盘价 / 上年最后收盘价) - 1；若当年上市、没有上年收盘，则用上市后最早收盘价。",
     "基金规模、运作费率、跟踪指数等资料来自 F10（规模为 NEW_SCALE 及披露日；运作费率 = DEC_GUANLIFEI + DEC_TUOGUANFEI），不是盘中跳动字段。",

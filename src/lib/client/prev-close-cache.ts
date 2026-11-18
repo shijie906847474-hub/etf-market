@@ -122,6 +122,66 @@ export async function writeHistoryCache(entry: PrevCloseCacheEntry): Promise<voi
   }
 }
 
+function asEpochSeconds(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return value > 1e12 ? Math.floor(value / 1000) : Math.floor(value);
+}
+
+function estimateEntryBytes(entry: PrevCloseCacheEntry): number {
+  try {
+    return new Blob([JSON.stringify(entry)]).size;
+  } catch {
+    return 0;
+  }
+}
+
+function toCacheItem(entry: PrevCloseCacheEntry, sizeBytes?: number): import("../types").HistoryCacheItem | null {
+  if (!isHistoryCacheValid(entry, entry.asOfDate)) return null;
+  return {
+    date: entry.asOfDate,
+    etfCount: entry.payload.list.length,
+    savedAt: asEpochSeconds(entry.savedAt),
+    sizeBytes: sizeBytes && sizeBytes > 0 ? sizeBytes : estimateEntryBytes(entry),
+  };
+}
+
+export async function listClientHistoryCache(): Promise<import("../types").HistoryCacheItem[]> {
+  const items = new Map<string, import("../types").HistoryCacheItem>();
+  const add = (entry: PrevCloseCacheEntry | null, sizeBytes?: number) => {
+    if (!entry) return;
+    const item = toCacheItem(entry, sizeBytes);
+    if (!item) return;
+    const prev = items.get(item.date);
+    if (prev && prev.savedAt >= item.savedAt) return;
+    items.set(item.date, item);
+  };
+  try {
+    const keys = await idbKeys();
+    for (const key of keys) {
+      if (!(key.startsWith("history-v") || key === LEGACY_IDB_KEY)) continue;
+      add(await idbGet(key));
+    }
+  } catch {
+    /* fall through to localStorage */
+  }
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !(key.startsWith("history-v") || key === PREV_CLOSE_CACHE_KEY)) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      try {
+        add(JSON.parse(raw) as PrevCloseCacheEntry, new Blob([raw]).size);
+      } catch {
+        /* ignore one bad entry */
+      }
+    }
+  } catch {
+    /* private mode */
+  }
+  return [...items.values()].sort((a, b) => b.date.localeCompare(a.date));
+}
+
 export async function deleteClientHistoryCache(date: string): Promise<void> {
   try {
     await idbDelete(historyKey(date));

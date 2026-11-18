@@ -1,17 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { COLUMNS, DEFAULT_VISIBLE, columnLabel, type ColumnKey } from "@/components/columns";
 import { fetchMarketStream, isAbortError } from "@/lib/client/market-stream";
 import { HistorySettings } from "@/components/HistorySettings";
 import { isHistoryCacheValid, readHistoryCache, writeHistoryCache } from "@/lib/client/prev-close-cache";
+import { readLiveMarketCache, writeLiveMarketCache } from "@/lib/client/live-market-cache";
+import { useRefreshInterval } from "@/lib/client/refresh-interval";
 import type { LoadProgress } from "@/lib/load-progress";
 import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands, lastPriceLabel, VOLUME_RATIO_SURGE } from "@/lib/format";
 import { shanghaiDateString } from "@/lib/market-hours";
 import { buildThemeHotspots, classifyTheme, THEME_MIN_COUNT } from "@/lib/themes";
 import type { EtfCategory, EtfRow, MarketPayload } from "@/lib/types";
-import { ALL_CATEGORIES } from "@/lib/types";
 import { isWatched, loadWatchlist, saveWatchlist, toggleWatch, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
 
@@ -137,6 +138,9 @@ const FEE_BUCKETS: RangeBucket[] = [
 
 const CHANGE_OPTIONS: Array<[string, string]> = [
   ["", "全部"],
+  ["up", "上涨"],
+  ["down", "下跌"],
+  ["flat", "平盘"],
   ["up5", "涨幅超过 5%"],
   ["up2to5", "涨幅 2%～5%"],
   ["up0to2", "涨幅 0%～2%"],
@@ -178,6 +182,12 @@ function matchChange(v: number | null, bucket: string): boolean {
   if (!bucket) return true;
   if (v === null) return false;
   switch (bucket) {
+    case "up":
+      return v > 0;
+    case "down":
+      return v < 0;
+    case "flat":
+      return v === 0;
     case "up5":
       return v > 5;
     case "up2to5":
@@ -300,14 +310,39 @@ function rawSort(row: EtfRow, key: ColumnKey): string | number | null {
   return v === undefined ? null : String(v);
 }
 
-function HeaderStat({ label, value, sub }: { label: string; value: string; sub?: string }) {
-  return (
-    <div className="border-r border-terminal-border px-3 py-2 last:border-r-0 min-w-[120px]">
+function HeaderStat({
+  label,
+  value,
+  sub,
+  onClick,
+  active,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  onClick?: () => void;
+  active?: boolean;
+}) {
+  const className = cn(
+    "border-r border-terminal-border px-3 py-2 last:border-r-0 min-w-[120px] text-left",
+    onClick && "hover:bg-white/5",
+    active && "bg-white/10",
+  );
+  const body = (
+    <>
       <div className="text-[11px] text-terminal-muted">{label}</div>
       <div className="font-mono text-base tabular-nums">{value}</div>
       {sub ? <div className="text-[11px] text-terminal-muted">{sub}</div> : null}
-    </div>
+    </>
   );
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} className={className}>
+        {body}
+      </button>
+    );
+  }
+  return <div className={className}>{body}</div>;
 }
 
 function LoadProgressPanel({
@@ -358,6 +393,23 @@ function LoadProgressPanel({
   );
 }
 
+function majorityDate(rows: EtfRow[], key: "navDate" | "aumDate"): string | null {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const d = row[key];
+    if (d) counts.set(d, (counts.get(d) ?? 0) + 1);
+  }
+  let best: string | null = null;
+  let bestCount = 0;
+  for (const [date, count] of counts) {
+    if (count > bestCount || (count === bestCount && best !== null && date > best)) {
+      best = date;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 export function MarketTerminal() {
   const [view, setView] = useState<MarketView>("today");
   const [liveData, setLiveData] = useState<MarketPayload | null>(null);
@@ -366,11 +418,18 @@ export function MarketTerminal() {
   const [tradeDates, setTradeDates] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [progress, setProgress] = useState<LoadProgress | null>(null);
   const [loadStartedAt, setLoadStartedAt] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(0);
+  const [refreshIntervalMs] = useRefreshInterval();
+  const refreshIntervalRef = useRef(refreshIntervalMs);
+  refreshIntervalRef.current = refreshIntervalMs;
+  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
   const hasLiveRef = useRef(false);
   const tradeDatesRef = useRef<string[]>([]);
+  const headerRef = useRef<HTMLElement>(null);
+  const [headerOffset, setHeaderOffset] = useState(0);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [sortKey, setSortKey] = useState<ColumnKey>("turnover");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
@@ -379,6 +438,24 @@ export function MarketTerminal() {
   const [visible, setVisible] = useState<ColumnKey[]>(DEFAULT_VISIBLE);
   const [showCols, setShowCols] = useState(false);
   const [groups, setGroups] = useState<WatchGroup[]>([]);
+
+  useLayoutEffect(() => {
+    const cached = readLiveMarketCache();
+    if (!cached) return;
+    hasLiveRef.current = true;
+    setLiveData(cached);
+    setLoading(false);
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const update = () => setHeaderOffset(el.getBoundingClientRect().height);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [view]);
 
   useEffect(() => {
     setGroups(loadWatchlist());
@@ -393,14 +470,21 @@ export function MarketTerminal() {
   tradeDatesRef.current = tradeDates;
   const data = view === "history" ? prevData : liveData;
 
+  const applyLive = useCallback((payload: MarketPayload) => {
+    hasLiveRef.current = true;
+    setLiveData(payload);
+    writeLiveMarketCache(payload);
+    setLoading(false);
+  }, []);
+
   const loadLive = useCallback(async (opts?: { stream?: boolean; signal?: AbortSignal }) => {
+    const keepExisting = hasLiveRef.current;
+    if (keepExisting) setRefreshing(true);
     try {
       setError(null);
       const json = opts?.stream
         ? await fetchMarketStream("/api/market?stream=1", setProgress, opts.signal, (partial) => {
-            hasLiveRef.current = true;
-            setLiveData(partial);
-            setLoading(false);
+            applyLive(partial);
           })
         : await (async () => {
             const res = await fetch("/api/market", { cache: "no-store", signal: opts?.signal });
@@ -409,15 +493,18 @@ export function MarketTerminal() {
             return body as MarketPayload;
           })();
       if (opts?.signal?.aborted) return;
-      hasLiveRef.current = true;
-      setLiveData(json);
+      applyLive(json);
     } catch (err) {
       if (opts?.signal?.aborted || isAbortError(err)) return;
-      setError(err instanceof Error ? err.message : "行情加载失败");
+      if (!keepExisting) setError(err instanceof Error ? err.message : "行情加载失败");
     } finally {
-      if (!opts?.signal?.aborted) setLoading(false);
+      if (!opts?.signal?.aborted) {
+        setLoading(false);
+        setRefreshing(false);
+        if (hasLiveRef.current) setNextRefreshAt(Date.now() + refreshIntervalRef.current);
+      }
     }
-  }, []);
+  }, [applyLive]);
 
   const ensureTradeDates = useCallback(async (signal?: AbortSignal) => {
     if (tradeDatesRef.current.length) return tradeDatesRef.current;
@@ -474,20 +561,25 @@ export function MarketTerminal() {
       return;
     }
     const ac = new AbortController();
-    setLoading(true);
+    if (view === "today") {
+      const cached = readLiveMarketCache();
+      if (cached) {
+        hasLiveRef.current = true;
+        setLiveData(cached);
+        setLoading(false);
+      }
+      if (!hasLiveRef.current) {
+        setLoading(true);
+        setProgress(null);
+        setLoadStartedAt(Date.now());
+      } else {
+        setLoading(false);
+      }
+      void loadLive({ stream: !hasLiveRef.current, signal: ac.signal });
+      return () => ac.abort();
+    }
     setProgress(null);
     setLoadStartedAt(Date.now());
-    if (view === "today") {
-      void loadLive({ stream: !hasLiveRef.current, signal: ac.signal });
-      const id = window.setInterval(() => {
-        if (!hasLiveRef.current) return;
-        void loadLive({ stream: false });
-      }, 15000);
-      return () => {
-        ac.abort();
-        window.clearInterval(id);
-      };
-    }
     void (async () => {
       try {
         setError(null);
@@ -519,26 +611,80 @@ export function MarketTerminal() {
   }, [view, historyDate, loadLive, loadHistory, ensureTradeDates]);
 
   useEffect(() => {
-    if (!loading || data) return;
+    if (view !== "today") return;
+    if (hasLiveRef.current) setNextRefreshAt(Date.now() + refreshIntervalMs);
+    const id = window.setInterval(() => {
+      if (!hasLiveRef.current) return;
+      void loadLive({ stream: false });
+    }, refreshIntervalMs);
+    return () => window.clearInterval(id);
+  }, [view, refreshIntervalMs, loadLive]);
+
+  useEffect(() => {
+    const needTick = (loading && !data) || view === "today";
+    if (!needTick) return;
     setNowTick(Date.now());
     const id = window.setInterval(() => setNowTick(Date.now()), 1000);
     return () => window.clearInterval(id);
-  }, [loading, data]);
+  }, [loading, data, view]);
+
+  const listedRows = useMemo(
+    () => (data ? data.list.filter((row) => row.status !== "终止上市") : []),
+    [data],
+  );
+
+  const pruneCascadeFilters = (next: Filters): Filters => {
+    const inCat = next.category === "全部" ? listedRows : listedRows.filter((row) => row.category === next.category);
+    if (next.theme && !inCat.some((row) => classifyTheme(row) === next.theme)) next.theme = "";
+    const inTheme = next.theme ? inCat.filter((row) => classifyTheme(row) === next.theme) : inCat;
+    const names = new Set(inTheme.map((row) => (row.indexName ?? "").trim()).filter(Boolean));
+    const hasNone = inTheme.some((row) => !(row.indexName ?? "").trim());
+    if (next.indexQuery === "__none__") {
+      if (!hasNone) next.indexQuery = "";
+    } else if (next.indexQuery && !names.has(next.indexQuery)) {
+      next.indexQuery = "";
+    }
+    return next;
+  };
 
   const updateFilter = <K extends keyof Filters>(key: K, value: Filters[K]) => {
-    setFilters((prev) => ({ ...prev, [key]: value }));
+    setFilters((prev) => {
+      const next = { ...prev, [key]: value };
+      // 热点主题榜是全市场入口：当前类型下没有该主题时，放开类型，避免筛成空集。
+      if (key === "theme" && value && next.category !== "全部") {
+        const exists = listedRows.some((row) => row.category === next.category && classifyTheme(row) === value);
+        if (!exists) next.category = "全部";
+      }
+      return pruneCascadeFilters(next);
+    });
     setPage(1);
   };
 
   const themeHotspots = useMemo(() => (data ? buildThemeHotspots(data.list) : []), [data]);
 
+  const themeOptions = useMemo(() => {
+    const opts: Array<[string, string]> = [["", "全部"]];
+    const source = filters.category === "全部" ? listedRows : listedRows.filter((row) => row.category === filters.category);
+    const counts = new Map<string, number>();
+    for (const row of source) {
+      const theme = classifyTheme(row);
+      counts.set(theme, (counts.get(theme) ?? 0) + 1);
+    }
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+    for (const [name, count] of sorted) opts.push([name, `${name}（${count}）`]);
+    return opts;
+  }, [listedRows, filters.category]);
+
   const indexOptions = useMemo(() => {
     const opts: Array<[string, string]> = [["", "全部"]];
-    if (!data) return opts;
+    const source = listedRows.filter((row) => {
+      if (filters.category !== "全部" && row.category !== filters.category) return false;
+      if (filters.theme && classifyTheme(row) !== filters.theme) return false;
+      return true;
+    });
     const counts = new Map<string, number>();
     let missing = 0;
-    for (const row of data.list) {
-      if (row.status === "终止上市") continue;
+    for (const row of source) {
       const name = (row.indexName ?? "").trim();
       if (!name) {
         missing += 1;
@@ -550,21 +696,7 @@ export function MarketTerminal() {
     for (const [name, count] of sorted) opts.push([name, `${name}（${count}）`]);
     if (missing > 0) opts.push(["__none__", `未披露跟踪指数（${missing}）`]);
     return opts;
-  }, [data]);
-
-  const themeOptions = useMemo(() => {
-    const opts: Array<[string, string]> = [["", "全部"]];
-    if (!data) return opts;
-    const counts = new Map<string, number>();
-    for (const row of data.list) {
-      if (row.status === "终止上市") continue;
-      const theme = classifyTheme(row);
-      counts.set(theme, (counts.get(theme) ?? 0) + 1);
-    }
-    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
-    for (const [name, count] of sorted) opts.push([name, `${name}（${count}）`]);
-    return opts;
-  }, [data]);
+  }, [listedRows, filters.category, filters.theme]);
 
   const filtered = useMemo(() => {
     if (!data) return [];
@@ -638,12 +770,15 @@ export function MarketTerminal() {
     saveWatchlist(next);
   };
 
+  const majorityNavDate = useMemo(() => majorityDate(filtered, "navDate"), [filtered]);
+  const majorityAumDate = useMemo(() => majorityDate(filtered, "aumDate"), [filtered]);
+
   const ov = data?.overview;
   const totalForBar = (ov?.up ?? 0) + (ov?.down ?? 0) + (ov?.flat ?? 0) || 1;
 
   return (
     <div className="min-h-screen">
-      <header className="sticky top-0 z-30 border-b border-terminal-border bg-terminal-header/95 backdrop-blur-sm">
+      <header ref={headerRef} className="sticky top-0 z-30 border-b border-terminal-border bg-terminal-header/95 backdrop-blur-sm">
         <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
           <div className="flex items-center gap-4">
             <div className="text-sm font-semibold tracking-wide">ETF MARKET</div>
@@ -728,12 +863,21 @@ export function MarketTerminal() {
             </>
           )}
           <span>页面拉取：{formatShanghai(data?.fetchedAt ?? null)}</span>
-          <span>状态：{error ? "接口异常" : data?.freshness ?? (loading ? "加载中" : "—")}</span>
+          <span>状态：{error ? "接口异常" : refreshing ? "正在刷新" : data?.freshness ?? (loading ? "加载中" : "—")}</span>
           {data ? (
             <span>
               {view === "history"
                 ? `资料覆盖 ${data.f10Coverage}/${data.list.length} · 净值覆盖 ${data.navCoverage ?? 0}/${data.list.length}`
                 : `资料覆盖 ${data.f10Coverage}/${data.list.length} · 净值覆盖 ${data.navCoverage ?? 0}/${data.list.length} · IOPV 覆盖 ${data.iopvCoverage}/${data.list.length}`}
+            </span>
+          ) : null}
+          {view === "today" && (data || refreshing) ? (
+            <span>
+              {refreshing
+                ? "正在刷新"
+                : nextRefreshAt != null
+                  ? `刷新倒计时 ${Math.max(0, Math.ceil((nextRefreshAt - (nowTick || Date.now())) / 1000))} 秒`
+                  : null}
             </span>
           ) : null}
         </div>
@@ -760,9 +904,24 @@ export function MarketTerminal() {
               sub={`覆盖 ${ov.aumCoverage} 只，取 F10 NEW_SCALE`}
             />
             <HeaderStat label="总成交额" value={formatMoney(ov.totalTurnover)} sub="不等于资金净流入" />
-            <HeaderStat label="上涨" value={String(ov.up)} />
-            <HeaderStat label="下跌" value={String(ov.down)} />
-            <HeaderStat label="平盘" value={String(ov.flat)} />
+            <HeaderStat
+              label="上涨"
+              value={String(ov.up)}
+              active={filters.changeBucket === "up"}
+              onClick={() => updateFilter("changeBucket", filters.changeBucket === "up" ? "" : "up")}
+            />
+            <HeaderStat
+              label="下跌"
+              value={String(ov.down)}
+              active={filters.changeBucket === "down"}
+              onClick={() => updateFilter("changeBucket", filters.changeBucket === "down" ? "" : "down")}
+            />
+            <HeaderStat
+              label="平盘"
+              value={String(ov.flat)}
+              active={filters.changeBucket === "flat"}
+              onClick={() => updateFilter("changeBucket", filters.changeBucket === "flat" ? "" : "flat")}
+            />
             <div className="min-w-[220px] flex-1 px-3 py-2">
               <div className="text-[11px] text-terminal-muted">涨跌分布</div>
               <div className="mt-1 flex h-2 overflow-hidden bg-terminal-panel">
@@ -782,16 +941,14 @@ export function MarketTerminal() {
             {view === "today" ? (
               <>
                 <RankList
-                  title="放量上涨 TOP 5"
-                  subtitle={`量比≥${VOLUME_RATIO_SURGE.toFixed(2)}`}
+                  title={`放量上涨 TOP 5（量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）`}
                   rows={ov.topVolumeUp ?? []}
                   field="changePct"
                   showVolumeRatio
                   emptyText={`暂无量比≥${VOLUME_RATIO_SURGE.toFixed(2)} 的上涨品种`}
                 />
                 <RankList
-                  title="放量下跌 TOP 5"
-                  subtitle={`量比≥${VOLUME_RATIO_SURGE.toFixed(2)}`}
+                  title={`放量下跌 TOP 5（量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）`}
                   rows={ov.topVolumeDown ?? []}
                   field="changePct"
                   showVolumeRatio
@@ -800,16 +957,15 @@ export function MarketTerminal() {
               </>
             ) : (
               <div className="border-r border-terminal-border px-3 py-2 lg:col-span-2">
-                <div className="mb-1 text-[12px] text-terminal-muted">放量上涨 / 放量下跌</div>
+                <div className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted">放量上涨 / 放量下跌</div>
                 <div className="text-[11px] leading-relaxed text-terminal-muted">
                   该榜依赖盘中量比（相对近 5 日同时段均量），历史收盘快照没有这一字段，因此不展示。
                 </div>
               </div>
             )}
             <div className="border-r border-terminal-border last:border-r-0 px-3 py-2">
-              <div className="mb-1 text-[12px] text-terminal-muted">{view === "history" ? "收盘日热点主题" : "当日热点主题"}</div>
-              <div className="text-[10px] text-terminal-muted mb-1">
-                按跟踪指数归类，成交额加权涨跌幅；至少 {THEME_MIN_COUNT} 只
+              <div className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted" title="按跟踪指数归类，成交额加权涨跌幅">
+                {view === "history" ? "收盘日热点主题" : "当日热点主题"}（至少{THEME_MIN_COUNT}只）
               </div>
               {themeHotspots.length === 0 ? (
                 <div className="text-[11px] leading-relaxed text-terminal-muted">暂无满足只数要求的主题</div>
@@ -820,14 +976,15 @@ export function MarketTerminal() {
                     type="button"
                     onClick={() => updateFilter("theme", filters.theme === h.theme ? "" : h.theme)}
                     className={cn(
-                      "flex w-full items-center justify-between py-0.5 text-left text-sm hover:bg-white/5",
+                      "flex w-full items-center gap-2 py-0.5 text-left text-sm hover:bg-white/5",
                       filters.theme === h.theme && "bg-white/10",
                     )}
                   >
-                    <span>
+                    <span className="min-w-0 flex-1 truncate">
                       {h.theme} <span className="text-[11px] text-terminal-muted">{h.count}只</span>
                     </span>
-                    <span className={cn("font-mono", changeClass(h.weightedReturn))}>{formatPct(h.weightedReturn)}</span>
+                    <span className={cn("w-14 shrink-0 text-right font-mono tabular-nums", changeClass(h.weightedReturn))}>{formatPct(h.weightedReturn)}</span>
+                    <span className="w-8 shrink-0" />
                   </button>
                 ))
               )}
@@ -875,20 +1032,19 @@ export function MarketTerminal() {
               className="h-8 w-40 border border-terminal-border bg-terminal-panel px-2 font-mono text-sm"
             />
           </label>
-          <Select
+          <SearchSelect
             label="跟踪指数"
             value={filters.indexQuery}
             onChange={(v) => updateFilter("indexQuery", v)}
             options={indexOptions}
-            className="max-w-[18rem]"
+            className="w-[18rem]"
           />
-          <Select label="类型" value={filters.category} onChange={(v) => updateFilter("category", v as Filters["category"])} options={["全部", ...ALL_CATEGORIES]} />
-          <Select
+          <SearchSelect
             label="热点主题"
             value={filters.theme}
             onChange={(v) => updateFilter("theme", v)}
             options={themeOptions}
-            className="max-w-[16rem]"
+            className="w-[16rem]"
           />
           <Select
             label="涨跌幅"
@@ -978,23 +1134,32 @@ export function MarketTerminal() {
           </label>
         </div>
         <div>
-          <table className="min-w-full text-sm">
-            <thead className="sticky top-0 z-10 bg-terminal-header">
+          <table className="min-w-full border-separate border-spacing-0 text-sm">
+            <thead>
               <tr>
-                <th className="w-8 border-b border-terminal-border px-1 py-1 text-left font-medium text-terminal-muted">自选</th>
+                <th
+                  className="sticky z-20 w-8 border-b border-terminal-border bg-terminal-header px-1 py-1 text-left font-medium text-terminal-muted"
+                  style={{ top: headerOffset }}
+                >
+                  自选
+                </th>
                 {COLUMNS.filter((c) => visible.includes(c.key)).map((c) => (
                   <th
                     key={c.key}
                     onClick={() => onSort(c.key)}
                     className={cn(
-                      "cursor-pointer whitespace-nowrap border-b border-terminal-border px-2 py-1 font-medium text-terminal-muted hover:text-terminal-text",
+                      "sticky z-20 cursor-pointer whitespace-nowrap border-b border-terminal-border bg-terminal-header px-2 py-1 font-medium text-terminal-muted hover:text-terminal-text",
                       c.align === "right" ? "text-right" : "text-left",
                     )}
+                    style={{ top: headerOffset }}
                   >
                     {columnLabel(c.key, view)}
                     {sortKey === c.key ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
-                    {c.key === "premiumPct" ? (
-                      <span className="ml-1 text-[10px] font-normal text-terminal-muted">净值</span>
+                    {c.key === "premiumPct" && majorityNavDate ? (
+                      <span className="ml-1 text-[10px] font-normal text-terminal-muted">{majorityNavDate}</span>
+                    ) : null}
+                    {c.key === "aum" && majorityAumDate ? (
+                      <span className="ml-1 text-[10px] font-normal text-terminal-muted">{majorityAumDate}</span>
                     ) : null}
                   </th>
                 ))}
@@ -1020,33 +1185,23 @@ export function MarketTerminal() {
                     const statusMuted =
                       (c.key === "last" || c.key === "status") &&
                       (row.status === "停牌" || row.status === "暂停交易" || row.status === "无行情" || row.status === "终止上市");
-                    const href = `/etf/${row.code}?market=${row.market}`;
-                    const inner = (
-                      <span
-                        className={cn(
-                          c.numeric && "font-mono tabular-nums",
-                          statusMuted && "text-terminal-muted",
-                          !statusMuted && colored && changeClass(row[c.key] as number | null),
-                        )}
-                      >
-                        {cellValue(row, c.key)}
-                        {c.key === "aum" && row.aumDate ? (
-                          <span className="ml-1 text-[10px] text-terminal-muted">{row.aumDate}</span>
-                        ) : null}
-                        {c.key === "premiumPct" && row.navDate ? (
-                          <span className="ml-1 text-[10px] font-normal text-terminal-muted">{row.navDate}</span>
-                        ) : null}
-                      </span>
-                    );
                     return (
                       <td key={c.key} className={cn("whitespace-nowrap px-2 py-1", c.align === "right" && "text-right")}>
-                        {c.key === "code" || c.key === "name" ? (
-                          <Link href={href} className="hover:underline">
-                            {inner}
-                          </Link>
-                        ) : (
-                          inner
-                        )}
+                        <span
+                          className={cn(
+                            c.numeric && "font-mono tabular-nums",
+                            statusMuted && "text-terminal-muted",
+                            !statusMuted && colored && changeClass(row[c.key] as number | null),
+                          )}
+                        >
+                          {cellValue(row, c.key)}
+                          {c.key === "aum" && row.aumDate && row.aumDate !== majorityAumDate ? (
+                            <span className="ml-1 text-[10px] text-terminal-muted">{row.aumDate}</span>
+                          ) : null}
+                          {c.key === "premiumPct" && row.navDate && row.navDate !== majorityNavDate ? (
+                            <span className="ml-1 text-[10px] font-normal text-terminal-muted">{row.navDate}</span>
+                          ) : null}
+                        </span>
                       </td>
                     );
                   })}
@@ -1083,14 +1238,12 @@ export function MarketTerminal() {
 
 function RankList({
   title,
-  subtitle,
   rows,
   field,
   showVolumeRatio,
   emptyText,
 }: {
   title: string;
-  subtitle?: string;
   rows: EtfRow[];
   field: "changePct" | "turnover";
   showVolumeRatio?: boolean;
@@ -1098,24 +1251,183 @@ function RankList({
 }) {
   return (
     <div className="border-r border-terminal-border px-3 py-2 last:border-r-0">
-      <div className="mb-1 text-[12px] text-terminal-muted">{title}</div>
-      {subtitle ? <div className="mb-1 text-[10px] text-terminal-muted">{subtitle}</div> : null}
+      <div className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted" title={title}>{title}</div>
       {rows.length === 0 && emptyText ? (
         <div className="py-1 text-[11px] text-terminal-muted">{emptyText}</div>
       ) : null}
       {rows.map((row, i) => (
-        <Link key={row.code} href={`/etf/${row.code}?market=${row.market}`} className="flex items-center justify-between py-0.5 text-sm hover:bg-white/5">
-          <span className="truncate">
-            <span className="mr-2 font-mono text-terminal-muted">{i + 1}</span>
-            {row.name}
-          </span>
-          <span className={cn("ml-2 shrink-0 font-mono", field === "changePct" ? changeClass(row.changePct) : "text-terminal-text")}>
+        <div key={row.code} className="flex items-center gap-2 py-0.5 text-sm">
+          <span className="w-4 shrink-0 font-mono tabular-nums text-terminal-muted">{i + 1}</span>
+          <span className="min-w-0 flex-1 truncate">{row.name}</span>
+          <span className={cn("w-14 shrink-0 text-right font-mono tabular-nums", field === "changePct" ? changeClass(row.changePct) : "text-terminal-text")}>
             {field === "changePct" ? formatPct(row.changePct) : formatMoney(row.turnover)}
-            {showVolumeRatio ? <span className="ml-2 text-[10px] text-terminal-muted">{formatNumber(row.volumeRatio, 2)}</span> : null}
           </span>
-        </Link>
+          <span className="w-8 shrink-0 text-right font-mono text-[10px] tabular-nums text-terminal-muted">
+            {showVolumeRatio ? formatNumber(row.volumeRatio, 2) : ""}
+          </span>
+        </div>
       ))}
     </div>
+  );
+}
+
+function normalizeFilterText(s: string) {
+  return s.trim().toLowerCase().replace(/\s+/g, "");
+}
+
+function fuzzyFilterText(haystack: string, query: string): boolean {
+  const h = normalizeFilterText(haystack);
+  const q = normalizeFilterText(query);
+  if (!q) return true;
+  if (h.includes(q)) return true;
+  let i = 0;
+  for (const ch of h) {
+    if (ch === q[i]) {
+      i += 1;
+      if (i >= q.length) return true;
+    }
+  }
+  return false;
+}
+
+function SearchSelect({
+  label,
+  value,
+  onChange,
+  options,
+  className,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: Array<string | [string, string]>;
+  className?: string;
+}) {
+  const rootRef = useRef<HTMLLabelElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const [typing, setTyping] = useState(false);
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+
+  const parsed = useMemo(
+    () => options.map((opt) => (typeof opt === "string" ? ([opt, opt] as [string, string]) : opt)),
+    [options],
+  );
+  const selectedLabel = parsed.find(([v]) => v === value)?.[1] ?? "全部";
+  const filtered = useMemo(() => {
+    if (!open || !typing || !query.trim()) return parsed;
+    return parsed.filter(([v, l]) => fuzzyFilterText(l, query) || fuzzyFilterText(v, query));
+  }, [parsed, open, typing, query]);
+
+  const close = () => {
+    setOpen(false);
+    setTyping(false);
+    setQuery("");
+    setActive(0);
+  };
+
+  const pick = (next: string) => {
+    onChange(next);
+    close();
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) close();
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  useEffect(() => {
+    setActive(0);
+  }, [query, open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const el = listRef.current?.querySelector("[data-active='true']") as HTMLElement | null;
+    el?.scrollIntoView({ block: "nearest" });
+  }, [active, open, filtered]);
+
+  return (
+    <label ref={rootRef} className={cn("relative text-xs", className)}>
+      <span className="mb-1 block text-terminal-muted">{label}</span>
+      <input
+        value={open && typing ? query : selectedLabel}
+        placeholder="输入筛选"
+        onChange={(e) => {
+          setTyping(true);
+          setQuery(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setOpen(true);
+            setActive((i) => Math.min(i + 1, Math.max(filtered.length - 1, 0)));
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setOpen(true);
+            setActive((i) => Math.max(i - 1, 0));
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            const hit = filtered[active];
+            if (hit) pick(hit[0]);
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            close();
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        className="h-8 w-full border border-terminal-border bg-terminal-panel px-2 text-sm outline-none focus:border-terminal-text/40"
+        role="combobox"
+        aria-expanded={open}
+        aria-autocomplete="list"
+        autoComplete="off"
+        spellCheck={false}
+      />
+      {open ? (
+        <div
+          ref={listRef}
+          role="listbox"
+          className="absolute z-30 mt-0.5 max-h-64 w-full min-w-full overflow-y-auto border border-terminal-border bg-terminal-header shadow-lg"
+        >
+          {filtered.length === 0 ? (
+            <div className="px-2 py-2 text-[12px] text-terminal-muted">无匹配项</div>
+          ) : (
+            filtered.map(([v, l], i) => {
+              const isActive = i === active;
+              const isSelected = v === value;
+              return (
+                <button
+                  key={`${v}::${l}`}
+                  type="button"
+                  role="option"
+                  aria-selected={isSelected}
+                  data-active={isActive ? "true" : "false"}
+                  onMouseEnter={() => setActive(i)}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    pick(v);
+                  }}
+                  className={cn(
+                    "block w-full truncate px-2 py-1 text-left text-sm",
+                    isActive ? "bg-white/10 text-terminal-text" : "text-terminal-text/90",
+                    isSelected && !isActive ? "text-terminal-text" : null,
+                  )}
+                >
+                  {isSelected ? "✓ " : ""}
+                  {l}
+                </button>
+              );
+            })
+          )}
+        </div>
+      ) : null}
+    </label>
   );
 }
 
