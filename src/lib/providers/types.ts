@@ -44,4 +44,5 @@ export interface MarketDataProvider {
   fetchKline(secid: string, klt: 101 | 102 | 103, limit?: number): Promise<KlineBar[]>;
   fetchTrends(secid: string): Promise<{ preClose: number | null; points: TrendPoint[] }>;
   fetchOfficialNav(code: string, asOfDate: string): Promise<OfficialNav | null>;
+  fetchLatestOfficialNav(code: string): Promise<OfficialNav | null>;
 }

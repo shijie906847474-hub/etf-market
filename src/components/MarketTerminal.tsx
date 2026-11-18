@@ -4,7 +4,8 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { COLUMNS, DEFAULT_VISIBLE, columnLabel, type ColumnKey } from "@/components/columns";
 import { fetchMarketStream, isAbortError } from "@/lib/client/market-stream";
-import { isPrevCloseCacheFresh, readPrevCloseCache, writePrevCloseCache } from "@/lib/client/prev-close-cache";
+import { HistorySettings } from "@/components/HistorySettings";
+import { isHistoryCacheValid, readHistoryCache, writeHistoryCache } from "@/lib/client/prev-close-cache";
 import type { LoadProgress } from "@/lib/load-progress";
 import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands, lastPriceLabel, VOLUME_RATIO_SURGE } from "@/lib/format";
 import { shanghaiDateString } from "@/lib/market-hours";
@@ -14,7 +15,7 @@ import { ALL_CATEGORIES } from "@/lib/types";
 import { isWatched, loadWatchlist, saveWatchlist, toggleWatch, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
 
-type MarketView = "today" | "prev";
+type MarketView = "today" | "history" | "settings";
 const COLUMN_STORE_KEY = "etf-market-columns-v3";
 const COLUMN_STORE_LEGACY = ["etf-market-columns-v2", "etf-market-columns-v1"];
 
@@ -249,7 +250,7 @@ function LoadProgressPanel({
   const percent = progress?.percent ?? 0;
   const elapsed = startedAt ? Math.max(0, Math.floor(((now || Date.now()) - startedAt) / 1000)) : 0;
   const fallback =
-    view === "prev" ? "正在构建上一交易日收盘快照…" : "正在从服务端拉取沪深场内 ETF 全量行情…";
+    view === "history" ? "正在构建所选交易日的收盘快照…" : "正在从服务端拉取沪深场内 ETF 全量行情…";
   return (
     <div className="max-w-xl px-3 py-10">
       <div className="text-sm text-terminal-muted">{progress?.label ?? fallback}</div>
@@ -274,9 +275,9 @@ function LoadProgressPanel({
         {progress && progress.total > 1 ? <span>{progress.done}/{progress.total}</span> : null}
         <span>已用时 {elapsed} 秒</span>
       </div>
-      {view === "prev" ? (
+      {view === "history" ? (
         <div className="mt-2 text-[11px] text-terminal-muted">
-          首次需按代码拉取日 K 与当日净值，可能需要一两分钟；完成后会写入本地缓存，之后打开该交易日无需再请求。
+          该日期首次加载需按代码拉取日 K 与当日净值，可能需要一两分钟；完成后会写入服务端本地缓存，之后打开同一交易日无需再请求。
         </div>
       ) : null}
     </div>
@@ -287,12 +288,15 @@ export function MarketTerminal() {
   const [view, setView] = useState<MarketView>("today");
   const [liveData, setLiveData] = useState<MarketPayload | null>(null);
   const [prevData, setPrevData] = useState<MarketPayload | null>(null);
+  const [historyDate, setHistoryDate] = useState("");
+  const [tradeDates, setTradeDates] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [progress, setProgress] = useState<LoadProgress | null>(null);
   const [loadStartedAt, setLoadStartedAt] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(0);
   const hasLiveRef = useRef(false);
+  const tradeDatesRef = useRef<string[]>([]);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [sortKey, setSortKey] = useState<ColumnKey>("turnover");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
@@ -312,7 +316,8 @@ export function MarketTerminal() {
     localStorage.setItem(COLUMN_STORE_KEY, JSON.stringify(next));
   };
 
-  const data = view === "prev" ? prevData : liveData;
+  tradeDatesRef.current = tradeDates;
+  const data = view === "history" ? prevData : liveData;
 
   const loadLive = useCallback(async (opts?: { stream?: boolean; signal?: AbortSignal }) => {
     try {
@@ -336,23 +341,39 @@ export function MarketTerminal() {
     }
   }, []);
 
-  const loadPrev = useCallback(async (signal?: AbortSignal) => {
+  const ensureTradeDates = useCallback(async (signal?: AbortSignal) => {
+    if (tradeDatesRef.current.length) return tradeDatesRef.current;
+    const res = await fetch("/api/history/dates", { cache: "no-store", signal });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || "无法获取交易日列表");
+    const dates: string[] = Array.isArray(body.dates) ? body.dates : [];
+    tradeDatesRef.current = dates;
+    setTradeDates(dates);
+    return dates;
+  }, []);
+
+  const loadHistory = useCallback(async (date: string, signal?: AbortSignal, force = false) => {
     const today = shanghaiDateString();
     try {
       setError(null);
-      const cached = await readPrevCloseCache();
-      if (signal?.aborted) return;
-      if (isPrevCloseCacheFresh(cached, today) && cached) {
-        setPrevData(cached.payload);
-        setLoading(false);
-        return;
+      if (!date) return;
+      setPrevData((curr) => (curr?.asOfDate === date ? curr : null));
+      if (!force) {
+        const cached = await readHistoryCache(date);
+        if (signal?.aborted) return;
+        if (isHistoryCacheValid(cached, date) && cached) {
+          setPrevData(cached.payload);
+          setLoading(false);
+          return;
+        }
       }
       setLoading(true);
-      const json = await fetchMarketStream("/api/market?view=prev&stream=1", setProgress, signal);
+      const qs = new URLSearchParams({ view: "history", date, stream: "1" });
+      const json = await fetchMarketStream(`/api/market?${qs.toString()}`, setProgress, signal);
       if (signal?.aborted) return;
       setPrevData(json);
       if (json?.asOfDate && Array.isArray(json.list)) {
-        await writePrevCloseCache({
+        await writeHistoryCache({
           asOfDate: json.asOfDate,
           shanghaiDate: today,
           savedAt: Date.now(),
@@ -361,19 +382,26 @@ export function MarketTerminal() {
       }
     } catch (err) {
       if (signal?.aborted || isAbortError(err)) return;
-      setError(err instanceof Error ? err.message : "上一交易日收盘快照加载失败");
+      setError(err instanceof Error ? err.message : "历史收盘快照加载失败");
     } finally {
       if (!signal?.aborted) setLoading(false);
     }
   }, []);
 
   const load = useCallback(() => {
+    if (view === "settings") return;
     setProgress(null);
     setLoadStartedAt(Date.now());
-    return view === "prev" ? loadPrev() : loadLive({ stream: !hasLiveRef.current });
-  }, [view, loadPrev, loadLive]);
+    return view === "history" ? loadHistory(historyDate, undefined, true) : loadLive({ stream: !hasLiveRef.current });
+  }, [view, historyDate, loadHistory, loadLive]);
 
   useEffect(() => {
+    if (view === "settings") {
+      setLoading(false);
+      setProgress(null);
+      setError(null);
+      return;
+    }
     const ac = new AbortController();
     setLoading(true);
     setProgress(null);
@@ -386,9 +414,35 @@ export function MarketTerminal() {
         window.clearInterval(id);
       };
     }
-    void loadPrev(ac.signal);
+    void (async () => {
+      try {
+        setError(null);
+        const dates = await ensureTradeDates(ac.signal);
+        if (ac.signal.aborted) return;
+        if (!historyDate) {
+          const next = dates[0] ?? "";
+          if (next) setHistoryDate(next);
+          else {
+            setError("无法确定可展示的历史交易日");
+            setLoading(false);
+          }
+          return;
+        }
+        if (dates.length && !dates.includes(historyDate)) {
+          setError(`${historyDate} 不是已结束的沪深交易日，没有收盘行情可展示。`);
+          setPrevData(null);
+          setLoading(false);
+          return;
+        }
+        await loadHistory(historyDate, ac.signal);
+      } catch (err) {
+        if (ac.signal.aborted || isAbortError(err)) return;
+        setError(err instanceof Error ? err.message : "无法获取交易日列表");
+        setLoading(false);
+      }
+    })();
     return () => ac.abort();
-  }, [view, loadLive, loadPrev]);
+  }, [view, historyDate, loadLive, loadHistory, ensureTradeDates]);
 
   useEffect(() => {
     if (!loading || data) return;
@@ -404,6 +458,26 @@ export function MarketTerminal() {
 
   const themeHotspots = useMemo(() => (data ? buildThemeHotspots(data.list) : []), [data]);
 
+  const indexOptions = useMemo(() => {
+    const opts: Array<[string, string]> = [["", "全部"]];
+    if (!data) return opts;
+    const counts = new Map<string, number>();
+    let missing = 0;
+    for (const row of data.list) {
+      if (row.status === "终止上市") continue;
+      const name = (row.indexName ?? "").trim();
+      if (!name) {
+        missing += 1;
+        continue;
+      }
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+    for (const [name, count] of sorted) opts.push([name, `${name}（${count}）`]);
+    if (missing > 0) opts.push(["__none__", `未披露跟踪指数（${missing}）`]);
+    return opts;
+  }, [data]);
+
   const filtered = useMemo(() => {
     if (!data) return [];
     const q = filters.search.trim().toLowerCase();
@@ -412,13 +486,11 @@ export function MarketTerminal() {
       if (filters.category !== "全部" && row.category !== filters.category) return false;
       if (filters.theme && classifyTheme(row) !== filters.theme) return false;
       if (q && !row.code.includes(q) && !row.name.toLowerCase().includes(q)) return false;
-      const idx = filters.indexQuery.trim().toLowerCase();
-      if (idx) {
-        const indexName = (row.indexName ?? "").toLowerCase();
-        const indexCode = (row.indexCode ?? "").toLowerCase();
-        const indexHit = indexName.includes(idx) || indexCode.includes(idx);
-        const codeHit = /^\d{6}$/.test(idx) && row.code.toLowerCase() === idx;
-        if (!indexHit && !codeHit) return false;
+      const idx = filters.indexQuery;
+      if (idx === "__none__") {
+        if ((row.indexName ?? "").trim()) return false;
+      } else if (idx) {
+        if ((row.indexName ?? "").trim() !== idx) return false;
       }
       if (!matchChange(row.changePct, filters.changeBucket)) return false;
       if (!matchPremium(row.premiumPct, filters.premiumBucket)) return false;
@@ -468,7 +540,7 @@ export function MarketTerminal() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `etf-market-${view === "prev" && data?.asOfDate ? data.asOfDate : new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `etf-market-${view === "history" && data?.asOfDate ? data.asOfDate : new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -494,15 +566,15 @@ export function MarketTerminal() {
             <div className="flex items-center gap-1">
               <button
                 type="button"
-                onClick={() => setView("prev")}
+                onClick={() => setView("history")}
                 className={cn(
                   "rounded border px-2 py-0.5 text-xs",
-                  view === "prev"
+                  view === "history"
                     ? "border-terminal-text text-terminal-text"
                     : "border-transparent text-terminal-muted hover:text-terminal-text",
                 )}
               >
-                上一日
+                历史市场
               </button>
               <button
                 type="button"
@@ -516,21 +588,56 @@ export function MarketTerminal() {
               >
                 今日市场
               </button>
+              <button
+                type="button"
+                onClick={() => setView("settings")}
+                className={cn(
+                  "rounded border px-2 py-0.5 text-xs",
+                  view === "settings"
+                    ? "border-terminal-text text-terminal-text"
+                    : "border-transparent text-terminal-muted hover:text-terminal-text",
+                )}
+              >
+                设置
+              </button>
             </div>
+            {view === "history" ? (
+              <label className="flex items-center gap-1 text-xs text-terminal-muted">
+                <span>收盘日期</span>
+                <input
+                  type="date"
+                  value={historyDate}
+                  max={tradeDates[0] || undefined}
+                  min={tradeDates.length ? tradeDates[tradeDates.length - 1] : undefined}
+                  list="history-trade-dates"
+                  onChange={(e) => setHistoryDate(e.target.value)}
+                  className="border border-terminal-border bg-transparent px-1 py-0.5 font-mono text-xs text-terminal-text"
+                />
+                <datalist id="history-trade-dates">
+                  {tradeDates.map((d) => (
+                    <option key={d} value={d} />
+                  ))}
+                </datalist>
+              </label>
+            ) : null}
             <Link href="/watchlist" className="text-terminal-muted hover:text-terminal-text">
               我的自选
             </Link>
-            <button type="button" onClick={() => void load()} className="rounded border border-terminal-border px-2 py-0.5 text-xs text-terminal-muted hover:text-terminal-text">
-              刷新
-            </button>
+            {view === "settings" ? null : (
+              <button type="button" onClick={() => void load()} className="rounded border border-terminal-border px-2 py-0.5 text-xs text-terminal-muted hover:text-terminal-text">
+                刷新
+              </button>
+            )}
           </nav>
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-terminal-border px-3 py-1 text-[11px] text-terminal-muted">
           <span>数据来源：{data?.source ?? "东方财富公开行情"}</span>
-          {view === "prev" ? (
+          {view === "settings" ? (
+            <span>管理已缓存的历史收盘行情</span>
+          ) : view === "history" ? (
             <>
-              <span>收盘日期 {data?.asOfDate ?? "—"}</span>
-              <span>上一交易日收盘（本地缓存，非实时行情）· 收盘溢价（净值）</span>
+              <span>收盘日期 {data?.asOfDate ?? historyDate ?? "—"}</span>
+              <span>历史收盘快照（服务端按日期缓存，非实时行情）· 收盘溢价（当日净值）</span>
             </>
           ) : (
             <>
@@ -542,14 +649,18 @@ export function MarketTerminal() {
           <span>状态：{error ? "接口异常" : data?.freshness ?? (loading ? "加载中" : "—")}</span>
           {data ? (
             <span>
-              {view === "prev"
+              {view === "history"
                 ? `资料覆盖 ${data.f10Coverage}/${data.list.length} · 净值覆盖 ${data.navCoverage ?? 0}/${data.list.length}`
-                : `资料覆盖 ${data.f10Coverage}/${data.list.length} · IOPV 覆盖 ${data.iopvCoverage}/${data.list.length}`}
+                : `资料覆盖 ${data.f10Coverage}/${data.list.length} · 净值覆盖 ${data.navCoverage ?? 0}/${data.list.length} · IOPV 覆盖 ${data.iopvCoverage}/${data.list.length}`}
             </span>
           ) : null}
         </div>
       </header>
 
+      {view === "settings" ? (
+        <HistorySettings />
+      ) : (
+      <>
       {error ? (
         <div className="m-3 border border-up/40 bg-up/10 px-3 py-2 text-sm text-up">加载失败：{error}。页面不会用模拟数据替代真实行情。</div>
       ) : null}
@@ -609,12 +720,12 @@ export function MarketTerminal() {
               <div className="border-r border-terminal-border px-3 py-2 lg:col-span-2">
                 <div className="mb-1 text-[12px] text-terminal-muted">放量上涨 / 放量下跌</div>
                 <div className="text-[11px] leading-relaxed text-terminal-muted">
-                  该榜依赖盘中量比（相对近 5 日同时段均量），上一日收盘快照没有这一字段，因此不展示。
+                  该榜依赖盘中量比（相对近 5 日同时段均量），历史收盘快照没有这一字段，因此不展示。
                 </div>
               </div>
             )}
             <div className="border-r border-terminal-border last:border-r-0 px-3 py-2">
-              <div className="mb-1 text-[12px] text-terminal-muted">{view === "prev" ? "收盘日热点主题" : "当日热点主题"}</div>
+              <div className="mb-1 text-[12px] text-terminal-muted">{view === "history" ? "收盘日热点主题" : "当日热点主题"}</div>
               <div className="text-[10px] text-terminal-muted mb-1">
                 按跟踪指数归类，成交额加权涨跌幅；至少 {THEME_MIN_COUNT} 只
               </div>
@@ -682,15 +793,13 @@ export function MarketTerminal() {
               className="h-8 w-40 border border-terminal-border bg-terminal-panel px-2 font-mono text-sm"
             />
           </label>
-          <label className="text-xs">
-            <span className="mb-1 block text-terminal-muted">跟踪指数</span>
-            <input
-              value={filters.indexQuery}
-              onChange={(e) => updateFilter("indexQuery", e.target.value)}
-              placeholder="指数名称/代码，也可填基金代码"
-              className="h-8 w-40 border border-terminal-border bg-terminal-panel px-2 font-mono text-sm"
-            />
-          </label>
+          <Select
+            label="跟踪指数"
+            value={filters.indexQuery}
+            onChange={(v) => updateFilter("indexQuery", v)}
+            options={indexOptions}
+            className="max-w-[18rem]"
+          />
           <Select label="类型" value={filters.category} onChange={(v) => updateFilter("category", v as Filters["category"])} options={["全部", ...ALL_CATEGORIES]} />
           {filters.theme ? (
             <button
@@ -716,7 +825,7 @@ export function MarketTerminal() {
             ]}
           />
           <Select
-            label={view === "prev" ? "收盘溢价" : "折溢价"}
+            label={view === "history" ? "收盘溢价" : "折溢价"}
             value={filters.premiumBucket}
             onChange={(v) => updateFilter("premiumBucket", v)}
             options={[
@@ -812,7 +921,7 @@ export function MarketTerminal() {
                   >
                     {columnLabel(c.key, view)}
                     {sortKey === c.key ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
-                    {c.key === "premiumPct" && view === "prev" ? (
+                    {c.key === "premiumPct" ? (
                       <span className="ml-1 text-[10px] font-normal text-terminal-muted">净值</span>
                     ) : null}
                   </th>
@@ -851,6 +960,9 @@ export function MarketTerminal() {
                         {cellValue(row, c.key)}
                         {c.key === "aum" && row.aumDate ? (
                           <span className="ml-1 text-[10px] text-terminal-muted">{row.aumDate}</span>
+                        ) : null}
+                        {c.key === "premiumPct" && row.navDate ? (
+                          <span className="ml-1 text-[10px] font-normal text-terminal-muted">{row.navDate}</span>
                         ) : null}
                       </span>
                     );
@@ -891,6 +1003,8 @@ export function MarketTerminal() {
           <div key={n}>{n}</div>
         ))}
       </footer>
+      </>
+      )}
     </div>
   );
 }
@@ -938,16 +1052,22 @@ function Select({
   value,
   onChange,
   options,
+  className,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   options: Array<string | [string, string]>;
+  className?: string;
 }) {
   return (
     <label className="text-xs">
       <span className="mb-1 block text-terminal-muted">{label}</span>
-      <select value={value} onChange={(e) => onChange(e.target.value)} className="h-8 border border-terminal-border bg-terminal-panel px-1 text-sm">
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={cn("h-8 border border-terminal-border bg-terminal-panel px-1 text-sm", className)}
+      >
         {options.map((opt) => {
           const [v, l] = typeof opt === "string" ? [opt, opt] : opt;
           return (

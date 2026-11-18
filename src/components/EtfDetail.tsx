@@ -135,15 +135,19 @@ export function EtfDetail({ code, market }: { code: string; market?: string }) {
               <Metric label="成交量" value={formatVolumeHands(row.volume)} />
               <Metric label="换手率" value={formatPct(row.turnoverRate)} />
               <Metric label="IOPV" value={formatPrice(row.iopv)} hint="stock/get f71" />
-              <Metric label="折溢价率" value={formatPct(row.premiumPct)} colored={row.premiumPct} hint="(最新价-IOPV)/IOPV" />
+              <Metric label="折溢价率" value={formatPct(row.premiumPct)} colored={row.premiumPct} hint="(最新价-最新公布净值)/净值" />
               <Metric label="基金规模" value={formatAum(row.aum)} hint={row.aumDate ? `披露 ${row.aumDate}` : "缺失"} />
               <Metric label="量比" value={formatNumber(row.volumeRatio, 2)} />
             </div>
             {row.nav !== null ? (
               <div className="mt-2 text-[11px] text-terminal-muted">
-                基金份额净值 NAV = {formatPrice(row.nav)}（stock/get f131，不用于折溢价，也不是 IOPV）
+                基金份额净值 NAV = {formatPrice(row.nav)}
+                {row.navDate ? `（${row.navDate}，官方公布单位净值）` : "（官方公布单位净值）"}
+                ，用于折溢价；IOPV 仅作盘中参考。
               </div>
-            ) : null}
+            ) : (
+              <div className="mt-2 text-[11px] text-terminal-muted">尚未获得官方公布单位净值，折溢价暂不计算，不会用 IOPV 或昨收代替。</div>
+            )}
           </section>
 
           {detail.warnings.length > 0 ? (

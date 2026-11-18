@@ -194,3 +194,10 @@ export const ALL_CATEGORIES: EtfCategory[] = [
 ];
 
 export type SortKey = keyof EtfRow;
+
+export interface HistoryCacheItem {
+  date: string;
+  etfCount: number;
+  savedAt: number;
+  sizeBytes: number;
+}

@@ -65,7 +65,7 @@ export const COLUMNS: ColumnDef[] = [
 
 export const DEFAULT_VISIBLE = COLUMNS.filter((c) => c.defaultVisible).map((c) => c.key);
 
-export function columnLabel(key: ColumnKey, view: "today" | "prev"): string {
-  if (view === "prev" && key === "premiumPct") return "收盘溢价率";
+export function columnLabel(key: ColumnKey, view: "today" | "history" | "settings"): string {
+  if (view === "history" && key === "premiumPct") return "收盘溢价率";
   return COLUMNS.find((c) => c.key === key)?.label ?? key;
 }

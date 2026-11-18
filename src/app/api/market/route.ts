@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import type { LoadProgress } from "@/lib/load-progress";
 import { getMarketPayload } from "@/lib/server/market-service";
-import { getPrevClosePayload } from "@/lib/server/prev-close";
+import { getHistoryPayload } from "@/lib/server/prev-close";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -30,7 +30,10 @@ export async function GET(req: Request) {
 
   if (!stream) {
     try {
-      const data = view === "prev" ? await getPrevClosePayload() : await getMarketPayload();
+      const data =
+        view === "prev" || view === "history"
+          ? await getHistoryPayload(url.searchParams.get("date"))
+          : await getMarketPayload();
       return NextResponse.json(data);
     } catch (err) {
       return NextResponse.json(errorBody(err), { status: 502 });
@@ -50,7 +53,10 @@ export async function GET(req: Request) {
       };
       const onProgress = (p: LoadProgress) => send("progress", p);
       try {
-        const data = view === "prev" ? await getPrevClosePayload(onProgress) : await getMarketPayload(onProgress);
+        const data =
+          view === "prev" || view === "history"
+            ? await getHistoryPayload(url.searchParams.get("date"), onProgress)
+            : await getMarketPayload(onProgress);
         send("result", data);
       } catch (err) {
         send("error", errorBody(err));

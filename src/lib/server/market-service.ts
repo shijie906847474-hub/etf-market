@@ -1,8 +1,8 @@
 import { memoryGet, memorySet, readJsonFile, writeJsonFile } from "../cache";
 import { classifyEtf, detectStatus } from "../classify";
 import { buildThemeHotspots } from "../themes";
-import { listedDateFromF26, operatingFeeOf, VOLUME_RATIO_SURGE } from "../format";
-import { marketFreshness } from "../market-hours";
+import { listedDateFromF26, operatingFeeOf, premiumFromNav, VOLUME_RATIO_SURGE } from "../format";
+import { marketFreshness, shanghaiDateString } from "../market-hours";
 import { getMarketProvider } from "../providers";
 import type {
   CategoryStat,
@@ -14,34 +14,48 @@ import type {
   MarketPayload,
 } from "../types";
 import { ALL_CATEGORIES } from "../types";
+import type { OfficialNav } from "../providers/types";
 import type { LoadProgress } from "../load-progress";
 import { stagePercent } from "../load-progress";
 
 const QUOTE_TTL_MS = 12_000;
 const F10_TTL_MS = 18 * 60 * 60 * 1000;
 const IOPV_TTL_MS = 45_000;
+const NAV_TTL_MS = 6 * 60 * 60 * 1000;
+const NAV_MISS_TTL_MS = 60 * 60 * 1000;
+const NAV_CONCURRENCY = 10;
 const F10_FILE = "f10-cache.json";
 const IOPV_FILE = "iopv-cache.json";
+const NAV_FILE = "official-nav-cache.json";
 
 type F10Store = Record<string, FundProfile>;
 type IopvStore = Record<string, IopvSnapshot>;
+type OfficialNavEntry = {
+  code: string;
+  date: string | null;
+  nav: number | null;
+  updatedAt: number;
+};
+type NavStore = Record<string, OfficialNavEntry>;
 
 let f10Memory: F10Store = readJsonFile<F10Store>(F10_FILE) ?? {};
 let iopvMemory: IopvStore = readJsonFile<IopvStore>(IOPV_FILE) ?? {};
+let navMemory: NavStore = readJsonFile<NavStore>(NAV_FILE) ?? {};
 let f10Warming: Promise<void> | null = null;
 let iopvWarming: Promise<void> | null = null;
-
-function premiumPct(last: number | null, iopv: number | null): number | null {
-  if (last === null || iopv === null || iopv === 0) return null;
-  return ((last - iopv) / iopv) * 100;
-}
+let navWarming: Promise<void> | null = null;
 
 
 function hasSessionTrade(q: import("../providers/types").QuoteRaw): boolean {
   return (q.volume != null && q.volume > 0) || (q.turnover != null && q.turnover > 0) || q.open != null;
 }
 
-export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundProfile, iopv?: IopvSnapshot): EtfRow {
+export function mergeRow(
+  q: import("../providers/types").QuoteRaw,
+  f10?: FundProfile,
+  iopv?: IopvSnapshot,
+  officialNav?: OfficialNav | OfficialNavEntry | null,
+): EtfRow {
   let last = q.last;
   let change = q.change;
   let changePct = q.changePct;
@@ -79,9 +93,9 @@ export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundPro
     ask1: q.ask1,
     spread,
     iopv: iopv?.iopv ?? null,
-    nav: iopv?.nav ?? null,
-    navDate: null,
-    premiumPct: premiumPct(last, iopv?.iopv ?? null),
+    nav: officialNav?.nav ?? null,
+    navDate: officialNav?.date ?? null,
+    premiumPct: premiumFromNav(last, officialNav?.nav ?? null),
     listedDate: listedDateFromF26(q.listedDateRaw),
     quoteTime: q.quoteTime,
     ret5d: q.ret5d,
@@ -146,6 +160,73 @@ export async function ensureF10Ready(codes: string[], onProgress?: (done: number
 
 function iopvFresh(p: IopvSnapshot | undefined) {
   return Boolean(p && Date.now() - p.updatedAt < IOPV_TTL_MS);
+}
+
+function navFresh(p: OfficialNavEntry | undefined) {
+  if (!p) return false;
+  const ttl = p.nav === null || p.date === null ? NAV_MISS_TTL_MS : NAV_TTL_MS;
+  return Date.now() - p.updatedAt < ttl;
+}
+
+export function getCachedOfficialNav(code: string): OfficialNavEntry | undefined {
+  return navMemory[code];
+}
+
+async function warmOfficialNav(codes: string[], onProgress?: (done: number, total: number) => void) {
+  const provider = getMarketProvider();
+  const missing = codes.filter((c) => !navFresh(navMemory[c]));
+  if (missing.length === 0) {
+    onProgress?.(codes.length, codes.length);
+    return;
+  }
+  const report = (done: number) => {
+    const fresh = codes.filter((c) => navFresh(navMemory[c])).length;
+    onProgress?.(fresh, codes.length);
+  };
+  report(0);
+  for (let i = 0; i < missing.length; i += NAV_CONCURRENCY) {
+    const batch = missing.slice(i, i + NAV_CONCURRENCY);
+    const results = await Promise.allSettled(batch.map((code) => provider.fetchLatestOfficialNav(code)));
+    results.forEach((res, idx) => {
+      const code = batch[idx];
+      const now = Date.now();
+      if (res.status === "fulfilled" && res.value) {
+        navMemory[code] = { code, date: res.value.date, nav: res.value.nav, updatedAt: now };
+      } else if (res.status === "fulfilled") {
+        navMemory[code] = { code, date: null, nav: null, updatedAt: now };
+      }
+    });
+    if (i % 40 === 0) writeJsonFile(NAV_FILE, navMemory);
+    report(i + batch.length);
+  }
+  writeJsonFile(NAV_FILE, navMemory);
+  report(codes.length);
+}
+
+export async function ensureNavReady(codes: string[], onProgress?: (done: number, total: number) => void) {
+  const stale = codes.filter((c) => !navFresh(navMemory[c])).length;
+  if (stale === 0) {
+    onProgress?.(codes.length, codes.length);
+    return;
+  }
+  if (!navWarming) {
+    navWarming = warmOfficialNav(codes).finally(() => {
+      navWarming = null;
+    });
+  }
+  const started = Date.now();
+  const tick = () => {
+    onProgress?.(codes.filter((c) => navFresh(navMemory[c])).length, codes.length);
+  };
+  tick();
+  while (Date.now() - started < 180000) {
+    const inflight = navWarming;
+    if (!inflight) break;
+    if (codes.filter((c) => navFresh(navMemory[c])).length >= codes.length * 0.95) break;
+    await Promise.race([inflight, new Promise((r) => setTimeout(r, 400))]);
+    tick();
+  }
+  tick();
 }
 
 async function warmF10(codes: string[]) {
@@ -313,7 +394,7 @@ export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): 
     label: `已获取 ${quotes.quotes.length} 只行情，正在检查基金资料…`,
     done: 1,
     total: 1,
-    percent: 20,
+    percent: 15,
   });
   const codes = quotes.quotes.map((q) => q.code);
   await ensureF10Ready(codes, (done, total) => {
@@ -322,7 +403,16 @@ export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): 
       label: "正在补齐基金资料（规模、运作费率、跟踪指数）…",
       done,
       total,
-      percent: stagePercent(20, 90, done, total),
+      percent: stagePercent(15, 40, done, total),
+    });
+  });
+  await ensureNavReady(codes, (done, total) => {
+    onProgress?.({
+      stage: "nav",
+      label: "正在拉取最新公布的基金份额净值…",
+      done,
+      total,
+      percent: stagePercent(40, 94, done, total),
     });
   });
   ensureWarmers(
@@ -337,26 +427,30 @@ export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): 
     percent: 96,
   });
 
-  const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code]));
+  const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code], navMemory[q.code]));
   const f10Coverage = list.filter((x) => x.fundType).length;
   const iopvCoverage = list.filter((x) => x.iopv !== null).length;
+  const navCoverage = list.filter((x) => x.nav !== null && x.navDate !== null).length;
   const quoteTimes = list.map((x) => x.quoteTime).filter((x): x is number => x !== null);
   const quoteTime = quoteTimes.length ? Math.max(...quoteTimes) : null;
   const { freshness, delayed } = marketFreshness();
   const notes = [
     "数据来源为东方财富公开行情，不是交易所官方实时馈送。",
     "基金规模取自 F10 NEW_SCALE，并标注披露日；不是现价×份额。",
-    "折溢价 = (最新价 - IOPV) / IOPV。clist 不含 IOPV，由服务端缓存 stock/get 的 f71。",
-    "基金份额净值 NAV（stock/get f131）不用于折溢价。跨境品种 IOPV/净值可能因时差滞后。",
+    "折溢价 = (最新价 − 最新公布的基金份额净值) / 净值 × 100，与常见券商软件口径一致。净值取自东方财富基金历史净值接口 lsjz 的最新一条 DWJZ，并标注净值日期；不会用 IOPV、stock/get 的 f131、昨收或估值填补。",
+    "跨境/QDII 净值常滞后 1–2 个交易日，此时折溢价反映的是市价相对已公布净值的偏离，不是相对盘中 IOPV 的偏离。IOPV 仍单独展示，不参与折溢价。",
     "成交额、份额变化均不等于资金净流入。",
     "已实现跟踪误差暂无法从公开接口获取；如有数字仅为合同目标。",
     "今年涨跌幅取自东方财富 clist f25（年初至今），与日 K 按「上年最后交易日收盘价」计算的结果一致；抽样核验过 f127 并不是今年以来，故未使用。原「近一年涨跌幅」列仍映射 f25，今日市场中会与今年涨跌幅相同。",
     "运作费率 = 管理费率 + 托管费率（F10 DEC_GUANLIFEI + DEC_TUOGUANFEI），单位为年费率百分比；未核实到销售服务费字段，不另加该项。管理费或托管费缺失时运作费率显示为缺失。",
-    "放量上涨/放量下跌榜仅纳入量比≥1.50 的品种，再按涨跌幅排序；量比来自东方财富 clist f10（相对近 5 日同时段均量）。量比缺失或不足 1.50 的不进入榜单，不会用成交额或换手率顶替。上一日收盘快照没有盘中量比，该榜不展示。",
+    "放量上涨/放量下跌榜仅纳入量比≥1.50 的品种，再按涨跌幅排序；量比来自东方财富 clist f10（相对近 5 日同时段均量）。量比缺失或不足 1.50 的不进入榜单，不会用成交额或换手率顶替。历史收盘快照没有盘中量比，该榜不展示。",
     "热点主题按跟踪指数、基准和基金名称归入更细主题（如半导体、港股科技、红利），再按成交额加权涨跌幅排序；至少 5 只且能算出加权涨跌幅的主题才进入榜单，不会把「其他主题」算作热点。分类依据公开资料字段，不是官方行业分类。",
   ];
+  if (navCoverage < list.length) {
+    notes.push(`净值覆盖 ${navCoverage}/${list.length}；缺少已公布净值或缺少有效最新价时折溢价显示为缺失，不会用 IOPV 或昨收代替。`);
+  }
   if (iopvCoverage < list.length) {
-    notes.push(`IOPV 缓存覆盖 ${iopvCoverage}/${list.length}，未覆盖品种折溢价显示为缺失，不会用净值或昨收代替。`);
+    notes.push(`IOPV 缓存覆盖 ${iopvCoverage}/${list.length}，仅用于 IOPV 列与详情展示，不参与折溢价。`);
   }
   if (f10Coverage < list.length) {
     notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}，缺失资料的品种暂归入「其他」，不会仅按名称强行分类。`);
@@ -369,6 +463,7 @@ export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): 
     delayed,
     f10Coverage,
     iopvCoverage,
+    navCoverage,
     notes,
     overview: buildOverview(list),
     categories: buildCategories(list.filter((x) => x.status !== "终止上市")),
@@ -397,8 +492,22 @@ function riskWarnings(row: EtfRow): { level: "info" | "warn"; text: string }[] {
   if (row.premiumPct !== null && Math.abs(row.premiumPct) >= 1) {
     out.push({
       level: "warn",
-      text: `折溢价约 ${row.premiumPct.toFixed(2)}%，偏离较大，请结合 IOPV 时效与流动性判断。`,
+      text: `折溢价约 ${row.premiumPct.toFixed(2)}%，偏离较大，请结合净值日期与流动性判断。`,
     });
+  }
+  if (row.navDate) {
+    const today = shanghaiDateString();
+    const navMs = Date.parse(`${row.navDate}T00:00:00+08:00`);
+    const todayMs = Date.parse(`${today}T00:00:00+08:00`);
+    if (Number.isFinite(navMs) && Number.isFinite(todayMs)) {
+      const daysBehind = Math.round((todayMs - navMs) / 86_400_000);
+      if (daysBehind >= 1) {
+        out.push({
+          level: "info",
+          text: `折溢价所用净值日期为 ${row.navDate}，已滞后 ${daysBehind} 个自然日，跨境/QDII 品种较常见；这是相对已公布净值的偏离，不是相对盘中 IOPV 的偏离。`,
+        });
+      }
+    }
   }
   if (row.turnover !== null && row.turnover < 1_000_000) {
     out.push({ level: "warn", text: "成交额低于 100 万元，流动性较差，买卖冲击成本可能较高。" });
@@ -445,15 +554,26 @@ export async function getEtfDetail(code: string, marketHint?: number): Promise<E
   let quote = universe.quotes.find((q) => q.code === code);
   const market = (marketHint === 0 || marketHint === 1 ? marketHint : quote?.market) ?? guessMarket(code);
   const secid = `${market}.${code}`;
-  const [iopv, profile] = await Promise.all([
+  const [iopv, profile, officialNav] = await Promise.all([
     provider.fetchIopv(secid),
     f10Fresh(f10Memory[code]) ? Promise.resolve(f10Memory[code]) : provider.fetchFundProfile(code),
+    navFresh(navMemory[code])
+      ? Promise.resolve(
+          navMemory[code].nav !== null && navMemory[code].date
+            ? { code, date: navMemory[code].date as string, nav: navMemory[code].nav as number }
+            : null,
+        )
+      : provider.fetchLatestOfficialNav(code).catch(() => null),
   ]);
   if (profile) {
     f10Memory[code] = profile;
     writeJsonFile(F10_FILE, f10Memory);
   }
   iopvMemory[code] = iopv;
+  navMemory[code] = officialNav
+    ? { code, date: officialNav.date, nav: officialNav.nav, updatedAt: Date.now() }
+    : { code, date: null, nav: null, updatedAt: Date.now() };
+  writeJsonFile(NAV_FILE, navMemory);
   if (!quote) {
     quote = {
       code,
@@ -483,7 +603,7 @@ export async function getEtfDetail(code: string, marketHint?: number): Promise<E
       statusHint: null,
     };
   }
-  const row = mergeRow(quote, profile ?? f10Memory[code], iopv);
+  const row = mergeRow(quote, profile ?? f10Memory[code], iopv, navMemory[code]);
   const { freshness, delayed } = marketFreshness();
   return {
     source: provider.label,
@@ -493,8 +613,8 @@ export async function getEtfDetail(code: string, marketHint?: number): Promise<E
     row,
     iopvQuoteTime: iopv.quoteTime,
     notes: [
-      "IOPV 来自 stock/get 的 f71，基金份额净值来自 f131，二者不可互换。",
-      "折溢价仅在 IOPV 有效时计算。",
+      "折溢价 = (最新价 − 最新公布基金份额净值) / 净值，净值来自东方财富 lsjz 的 DWJZ，并标注净值日期。",
+      "IOPV 来自 stock/get 的 f71，仅作盘中参考，不用于折溢价。stock/get 的 f131 也不用于折溢价。",
     ],
     warnings: riskWarnings(row),
   };

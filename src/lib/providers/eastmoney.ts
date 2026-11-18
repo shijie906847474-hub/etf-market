@@ -359,6 +359,31 @@ export class EastMoneyProvider implements MarketDataProvider {
     }
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   }
+
+  async fetchLatestOfficialNav(code: string): Promise<OfficialNav | null> {
+    if (!/^\d{6}$/.test(code)) return null;
+    const url = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${encodeURIComponent(code)}&pageIndex=1&pageSize=5`;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const payload = (await fetchJson(url, 20000, { Referer: "https://fund.eastmoney.com/" })) as any;
+        const list = (payload?.Data?.LSJZList ?? []) as Record<string, unknown>[];
+        const rows = list
+          .map((item) => ({
+            date: String(item.FSRQ ?? "").slice(0, 10),
+            nav: toNum(item.DWJZ),
+          }))
+          .filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item.date) && item.nav !== null && item.nav !== 0)
+          .sort((a, b) => b.date.localeCompare(a.date));
+        if (!rows[0]) return null;
+        return { code, date: rows[0].date, nav: rows[0].nav as number };
+      } catch (err) {
+        lastErr = err;
+        await sleep(200 * (attempt + 1));
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  }
 }
 
 export const eastMoneyProvider = new EastMoneyProvider();

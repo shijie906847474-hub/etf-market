@@ -1,4 +1,4 @@
-export type LoadProgressStage = "universe" | "f10" | "asOfDate" | "klines" | "assemble" | "cached";
+export type LoadProgressStage = "universe" | "f10" | "nav" | "asOfDate" | "klines" | "assemble" | "cached";
 
 export type LoadProgress = {
   stage: LoadProgressStage;

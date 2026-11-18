@@ -104,6 +104,13 @@ export function operatingFeeOf(managementFee: number | null, custodyFee: number 
 /** 量比达到该阈值视为明显放大，用于放量上涨/下跌榜。 */
 export const VOLUME_RATIO_SURGE = 1.5;
 
+/** 与常见券商一致：折溢价 = (价格 − 基金份额净值) / 净值 × 100。缺少价格或净值时不计算。 */
+export function premiumFromNav(price: number | null, nav: number | null): number | null {
+  if (price === null || nav === null || nav === 0) return null;
+  return ((price - nav) / nav) * 100;
+}
+
+
 export function lastPriceLabel(row: { status: TradeStatus; last: number | null }): string {
   if (row.status === "停牌") return row.last == null ? "停牌" : `${formatPrice(row.last)} 停牌`;
   if (row.status === "暂停交易") return row.last == null ? "暂停交易" : `${formatPrice(row.last)} 暂停交易`;
