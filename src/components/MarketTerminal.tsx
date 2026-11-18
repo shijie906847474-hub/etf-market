@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { COLUMNS, DEFAULT_VISIBLE, columnLabel, type ColumnKey } from "@/components/columns";
+import { COLUMNS, DEFAULT_VISIBLE, columnLabel, type ColumnDef, type ColumnKey } from "@/components/columns";
 import { fetchMarketStream, isAbortError } from "@/lib/client/market-stream";
 import { HistorySettings } from "@/components/HistorySettings";
 import { isHistoryCacheValid, readHistoryCache, writeHistoryCache } from "@/lib/client/prev-close-cache";
@@ -58,6 +58,10 @@ function loadVisibleColumns(): ColumnKey[] {
     /* ignore */
   }
   return DEFAULT_VISIBLE;
+}
+
+function visibleColumnDefs(visible: ColumnKey[]): ColumnDef[] {
+  return visible.map((key) => COLUMNS.find((c) => c.key === key)).filter((c): c is ColumnDef => Boolean(c));
 }
 
 type SortDir = "asc" | "desc";
@@ -393,23 +397,6 @@ function LoadProgressPanel({
   );
 }
 
-function majorityDate(rows: EtfRow[], key: "navDate" | "aumDate"): string | null {
-  const counts = new Map<string, number>();
-  for (const row of rows) {
-    const d = row[key];
-    if (d) counts.set(d, (counts.get(d) ?? 0) + 1);
-  }
-  let best: string | null = null;
-  let bestCount = 0;
-  for (const [date, count] of counts) {
-    if (count > bestCount || (count === bestCount && best !== null && date > best)) {
-      best = date;
-      bestCount = count;
-    }
-  }
-  return best;
-}
-
 export function MarketTerminal() {
   const [view, setView] = useState<MarketView>("today");
   const [liveData, setLiveData] = useState<MarketPayload | null>(null);
@@ -466,6 +453,17 @@ export function MarketTerminal() {
     setVisible(next);
     localStorage.setItem(COLUMN_STORE_KEY, JSON.stringify(next));
   };
+
+  const moveVisibleCol = (index: number, dir: -1 | 1) => {
+    const next = [...visible];
+    const j = index + dir;
+    if (j < 0 || j >= next.length) return;
+    [next[index], next[j]] = [next[j], next[index]];
+    persistCols(next);
+  };
+
+  const visibleDefs = visibleColumnDefs(visible);
+  const hiddenCols = COLUMNS.filter((c) => !visible.includes(c.key));
 
   tradeDatesRef.current = tradeDates;
   const data = view === "history" ? prevData : liveData;
@@ -752,7 +750,7 @@ export function MarketTerminal() {
   };
 
   const exportCsv = () => {
-    const cols = COLUMNS.filter((c) => visible.includes(c.key));
+    const cols = visibleDefs;
     const header = cols.map((c) => csvEscape(columnLabel(c.key, view))).join(",");
     const lines = sorted.map((row) => cols.map((c) => csvEscape(cellValue(row, c.key))).join(","));
     const blob = new Blob(["\uFEFF" + [header, ...lines].join("\n")], { type: "text/csv;charset=utf-8" });
@@ -769,9 +767,6 @@ export function MarketTerminal() {
     setGroups(next);
     saveWatchlist(next);
   };
-
-  const majorityNavDate = useMemo(() => majorityDate(filtered, "navDate"), [filtered]);
-  const majorityAumDate = useMemo(() => majorityDate(filtered, "aumDate"), [filtered]);
 
   const ov = data?.overview;
   const totalForBar = (ov?.up ?? 0) + (ov?.down ?? 0) + (ov?.flat ?? 0) || 1;
@@ -964,8 +959,11 @@ export function MarketTerminal() {
               </div>
             )}
             <div className="border-r border-terminal-border last:border-r-0 px-3 py-2">
-              <div className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted" title="按跟踪指数归类，成交额加权涨跌幅">
-                {view === "history" ? "收盘日热点主题" : "当日热点主题"}（至少{THEME_MIN_COUNT}只）
+              <div
+                className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted"
+                title="超额收益 = 该主题成交额加权涨跌幅 − 全市场成交额加权涨跌幅（不含货币、停牌、暂停、无行情）。右侧为该主题成交额加权量比；历史收盘快照无量比。"
+              >
+                {view === "history" ? "收盘日热点主题" : "当日热点主题"}（至少{THEME_MIN_COUNT}只，超额）
               </div>
               {themeHotspots.length === 0 ? (
                 <div className="text-[11px] leading-relaxed text-terminal-muted">暂无满足只数要求的主题</div>
@@ -981,10 +979,15 @@ export function MarketTerminal() {
                     )}
                   >
                     <span className="min-w-0 flex-1 truncate">
-                      {h.theme} <span className="text-[11px] text-terminal-muted">{h.count}只</span>
+                      {h.theme}{" "}
+                      <span className="text-[11px] text-terminal-muted">
+                        {h.count}只 {h.up}/{h.down}
+                      </span>
                     </span>
-                    <span className={cn("w-14 shrink-0 text-right font-mono tabular-nums", changeClass(h.weightedReturn))}>{formatPct(h.weightedReturn)}</span>
-                    <span className="w-8 shrink-0" />
+                    <span className={cn("w-14 shrink-0 text-right font-mono tabular-nums", changeClass(h.excessReturn))}>{formatPct(h.excessReturn)}</span>
+                    <span className="w-8 shrink-0 text-right font-mono text-[11px] tabular-nums text-terminal-muted">
+                      {h.volumeRatio === null ? "" : formatNumber(h.volumeRatio, 2)}
+                    </span>
                   </button>
                 ))
               )}
@@ -1087,18 +1090,45 @@ export function MarketTerminal() {
               显示列
             </button>
             {showCols ? (
-              <div className="absolute right-0 z-20 mt-1 max-h-80 w-48 overflow-auto border border-terminal-border bg-terminal-panel p-2 text-xs shadow-xl">
-                {COLUMNS.map((c) => (
-                  <label key={c.key} className="flex items-center gap-2 py-0.5">
+              <div className="absolute right-0 z-50 mt-1 max-h-80 w-60 overflow-auto border border-terminal-border bg-terminal-panel p-2 text-xs shadow-xl">
+                <div className="mb-1 text-[10px] text-terminal-muted">勾选显示，用箭头调整已显示列的顺序</div>
+                {visible.map((key, i) => (
+                  <div key={key} className="flex items-center gap-1 py-0.5">
                     <input
                       type="checkbox"
-                      checked={visible.includes(c.key)}
-                      onChange={(e) => {
-                        const next = e.target.checked ? [...visible, c.key] : visible.filter((k) => k !== c.key);
+                      checked
+                      onChange={() => {
+                        const next = visible.filter((k) => k !== key);
                         if (next.length) persistCols(next);
                       }}
                     />
-                    {columnLabel(c.key, view)}
+                    <span className="min-w-0 flex-1 truncate">{columnLabel(key, view)}</span>
+                    <button
+                      type="button"
+                      disabled={i === 0}
+                      onClick={() => moveVisibleCol(i, -1)}
+                      className="h-5 w-5 shrink-0 border border-terminal-border text-[10px] leading-none disabled:opacity-30"
+                      aria-label="上移"
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      disabled={i === visible.length - 1}
+                      onClick={() => moveVisibleCol(i, 1)}
+                      className="h-5 w-5 shrink-0 border border-terminal-border text-[10px] leading-none disabled:opacity-30"
+                      aria-label="下移"
+                    >
+                      ↓
+                    </button>
+                  </div>
+                ))}
+                {hiddenCols.map((c) => (
+                  <label key={c.key} className="flex items-center gap-1 py-0.5 text-terminal-muted">
+                    <input type="checkbox" checked={false} onChange={() => persistCols([...visible, c.key])} />
+                    <span className="min-w-0 flex-1 truncate">{columnLabel(c.key, view)}</span>
+                    <span className="w-5 shrink-0" />
+                    <span className="w-5 shrink-0" />
                   </label>
                 ))}
               </div>
@@ -1143,7 +1173,7 @@ export function MarketTerminal() {
                 >
                   自选
                 </th>
-                {COLUMNS.filter((c) => visible.includes(c.key)).map((c) => (
+                {visibleDefs.map((c) => (
                   <th
                     key={c.key}
                     onClick={() => onSort(c.key)}
@@ -1155,12 +1185,6 @@ export function MarketTerminal() {
                   >
                     {columnLabel(c.key, view)}
                     {sortKey === c.key ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
-                    {c.key === "premiumPct" && majorityNavDate ? (
-                      <span className="ml-1 text-[10px] font-normal text-terminal-muted">{majorityNavDate}</span>
-                    ) : null}
-                    {c.key === "aum" && majorityAumDate ? (
-                      <span className="ml-1 text-[10px] font-normal text-terminal-muted">{majorityAumDate}</span>
-                    ) : null}
                   </th>
                 ))}
               </tr>
@@ -1195,12 +1219,6 @@ export function MarketTerminal() {
                           )}
                         >
                           {cellValue(row, c.key)}
-                          {c.key === "aum" && row.aumDate && row.aumDate !== majorityAumDate ? (
-                            <span className="ml-1 text-[10px] text-terminal-muted">{row.aumDate}</span>
-                          ) : null}
-                          {c.key === "premiumPct" && row.navDate && row.navDate !== majorityNavDate ? (
-                            <span className="ml-1 text-[10px] font-normal text-terminal-muted">{row.navDate}</span>
-                          ) : null}
                         </span>
                       </td>
                     );

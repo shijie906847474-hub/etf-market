@@ -125,7 +125,7 @@ export interface MarketOverview {
   topLosers: EtfRow[];
   topVolumeUp: EtfRow[];
   topVolumeDown: EtfRow[];
-  hotspots: { theme: string; weightedReturn: number | null; turnover: number; count: number }[];
+  hotspots: { theme: string; weightedReturn: number | null; excessReturn: number | null; volumeRatio: number | null; turnover: number; count: number; up: number; down: number }[];
 }
 
 export interface MarketPayload {

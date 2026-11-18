@@ -22,6 +22,8 @@ export interface ThemeStat {
   flat: number;
   turnover: number;
   weightedReturn: number | null;
+  excessReturn: number | null;
+  volumeRatio: number | null;
   equalReturn: number | null;
   representatives: { code: string; name: string; changePct: number | null; turnover: number | null }[];
 }
@@ -254,7 +256,9 @@ export function classifyTheme(input: ThemeInput): string {
   return "其他主题";
 }
 
-function statsOf(theme: string, items: Pick<EtfRow, "code" | "name" | "changePct" | "turnover">[]): ThemeStat {
+type ThemeRow = ThemeInput & Pick<EtfRow, "code" | "name" | "changePct" | "turnover" | "status" | "volumeRatio" | "category">;
+
+function statsOf(theme: string, items: Pick<EtfRow, "code" | "name" | "changePct" | "turnover" | "volumeRatio">[]): ThemeStat {
   const withPx = items.filter((x) => x.changePct !== null);
   const up = withPx.filter((x) => (x.changePct ?? 0) > 0).length;
   const down = withPx.filter((x) => (x.changePct ?? 0) < 0).length;
@@ -262,6 +266,8 @@ function statsOf(theme: string, items: Pick<EtfRow, "code" | "name" | "changePct
   const turnover = items.reduce((s, x) => s + (x.turnover ?? 0), 0);
   let weightedNum = 0;
   let weightedDen = 0;
+  let vrNum = 0;
+  let vrDen = 0;
   let eq = 0;
   let eqN = 0;
   for (const x of items) {
@@ -271,6 +277,10 @@ function statsOf(theme: string, items: Pick<EtfRow, "code" | "name" | "changePct
     if (x.turnover && x.turnover > 0) {
       weightedNum += x.changePct * x.turnover;
       weightedDen += x.turnover;
+      if (x.volumeRatio !== null) {
+        vrNum += x.volumeRatio * x.turnover;
+        vrDen += x.turnover;
+      }
     }
   }
   const representatives = [...items]
@@ -290,13 +300,15 @@ function statsOf(theme: string, items: Pick<EtfRow, "code" | "name" | "changePct
     flat,
     turnover,
     weightedReturn: weightedDen > 0 ? weightedNum / weightedDen : null,
+    excessReturn: null,
+    volumeRatio: vrDen > 0 ? vrNum / vrDen : null,
     equalReturn: eqN > 0 ? eq / eqN : null,
     representatives,
   };
 }
 
-export function buildThemeStats(list: Array<ThemeInput & Pick<EtfRow, "code" | "name" | "changePct" | "turnover" | "status">>): ThemeStat[] {
-  const groups = new Map<string, (ThemeInput & Pick<EtfRow, "code" | "name" | "changePct" | "turnover">)[]>();
+export function buildThemeStats(list: ThemeRow[]): ThemeStat[] {
+  const groups = new Map<string, ThemeRow[]>();
   for (const row of list) {
     const theme = classifyTheme(row);
     const arr = groups.get(theme) ?? [];
@@ -306,15 +318,30 @@ export function buildThemeStats(list: Array<ThemeInput & Pick<EtfRow, "code" | "
   return [...groups.entries()].map(([theme, items]) => statsOf(theme, items));
 }
 
+/** 全市场基准：不含货币、停牌、暂停、无行情、终止上市，成交额加权涨跌幅。货币成交额大、涨跌接近 0，会把基准拉扁。 */
+export function marketBenchmarkReturn(list: ThemeRow[]): number | null {
+  let num = 0;
+  let den = 0;
+  for (const x of list) {
+    if (x.category === "货币") continue;
+    if (x.status === "终止上市" || x.status === "停牌" || x.status === "暂停交易" || x.status === "无行情") continue;
+    if (x.changePct === null || !x.turnover || x.turnover <= 0) continue;
+    num += x.changePct * x.turnover;
+    den += x.turnover;
+  }
+  return den > 0 ? num / den : null;
+}
+
 const HIDDEN_HOTSPOT_THEMES = new Set(["其他主题", "其他", "宽基"]);
 
-export function buildThemeHotspots(
-  list: Array<ThemeInput & Pick<EtfRow, "code" | "name" | "changePct" | "turnover" | "status">>,
-  limit = THEME_HOTSPOT_LIMIT,
-): ThemeStat[] {
+export function buildThemeHotspots(list: ThemeRow[], limit = THEME_HOTSPOT_LIMIT): ThemeStat[] {
   const active = list.filter((x) => x.status !== "终止上市");
-  const qualified = buildThemeStats(active).filter(
-    (s) => s.count >= THEME_MIN_COUNT && s.weightedReturn !== null && !HIDDEN_HOTSPOT_THEMES.has(s.theme),
-  );
-  return [...qualified].sort((a, b) => (b.weightedReturn ?? -999) - (a.weightedReturn ?? -999)).slice(0, limit);
+  const market = marketBenchmarkReturn(list);
+  const qualified = buildThemeStats(active)
+    .map((s) => ({
+      ...s,
+      excessReturn: s.weightedReturn !== null && market !== null ? s.weightedReturn - market : null,
+    }))
+    .filter((s) => s.count >= THEME_MIN_COUNT && s.excessReturn !== null && !HIDDEN_HOTSPOT_THEMES.has(s.theme));
+  return [...qualified].sort((a, b) => (b.excessReturn ?? -999) - (a.excessReturn ?? -999)).slice(0, limit);
 }

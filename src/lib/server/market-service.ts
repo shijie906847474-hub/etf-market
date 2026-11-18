@@ -350,8 +350,12 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   const hotspots = buildThemeHotspots(active).map((c) => ({
     theme: c.theme,
     weightedReturn: c.weightedReturn,
+    excessReturn: c.excessReturn,
+    volumeRatio: c.volumeRatio,
     turnover: c.turnover,
     count: c.count,
+    up: c.up,
+    down: c.down,
   }));
   return {
     totalCount: list.length,
