@@ -1,3 +1,5 @@
+import type { TradeStatus } from "./types";
+
 const SHANGHAI = "Asia/Shanghai";
 
 export function formatShanghai(tsSec: number | null | undefined, withSeconds = true): string {
@@ -101,3 +103,11 @@ export function operatingFeeOf(managementFee: number | null, custodyFee: number 
 
 /** 量比达到该阈值视为明显放大，用于放量上涨/下跌榜。 */
 export const VOLUME_RATIO_SURGE = 1.5;
+
+export function lastPriceLabel(row: { status: TradeStatus; last: number | null }): string {
+  if (row.status === "停牌") return row.last == null ? "停牌" : `${formatPrice(row.last)} 停牌`;
+  if (row.status === "暂停交易") return row.last == null ? "暂停交易" : `${formatPrice(row.last)} 暂停交易`;
+  if (row.status === "无行情") return "无行情";
+  if (row.status === "终止上市") return row.last == null ? "终止上市" : `${formatPrice(row.last)} 终止上市`;
+  return formatPrice(row.last);
+}

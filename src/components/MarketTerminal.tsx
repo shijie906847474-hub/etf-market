@@ -1,10 +1,12 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { COLUMNS, DEFAULT_VISIBLE, columnLabel, type ColumnKey } from "@/components/columns";
+import { fetchMarketStream, isAbortError } from "@/lib/client/market-stream";
 import { isPrevCloseCacheFresh, readPrevCloseCache, writePrevCloseCache } from "@/lib/client/prev-close-cache";
-import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands, VOLUME_RATIO_SURGE } from "@/lib/format";
+import type { LoadProgress } from "@/lib/load-progress";
+import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands, lastPriceLabel, VOLUME_RATIO_SURGE } from "@/lib/format";
 import { shanghaiDateString } from "@/lib/market-hours";
 import { buildThemeHotspots, classifyTheme, THEME_MIN_COUNT } from "@/lib/themes";
 import type { EtfCategory, EtfRow, MarketPayload } from "@/lib/types";
@@ -171,7 +173,7 @@ function cellValue(row: EtfRow, key: ColumnKey): string {
     case "category":
       return row.category;
     case "last":
-      return formatPrice(row.last);
+      return lastPriceLabel(row);
     case "change":
       return formatPrice(row.change);
     case "changePct":
@@ -233,12 +235,64 @@ function HeaderStat({ label, value, sub }: { label: string; value: string; sub?:
   );
 }
 
+function LoadProgressPanel({
+  view,
+  progress,
+  startedAt,
+  now,
+}: {
+  view: MarketView;
+  progress: LoadProgress | null;
+  startedAt: number | null;
+  now: number;
+}) {
+  const percent = progress?.percent ?? 0;
+  const elapsed = startedAt ? Math.max(0, Math.floor(((now || Date.now()) - startedAt) / 1000)) : 0;
+  const fallback =
+    view === "prev" ? "正在构建上一交易日收盘快照…" : "正在从服务端拉取沪深场内 ETF 全量行情…";
+  return (
+    <div className="max-w-xl px-3 py-10">
+      <div className="text-sm text-terminal-muted">{progress?.label ?? fallback}</div>
+      <div
+        className="mt-3 h-1.5 overflow-hidden rounded-sm bg-terminal-border"
+        role="progressbar"
+        aria-label="数据加载进度"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+      >
+        <div
+          className={cn(
+            "h-full bg-terminal-text",
+            progress ? "transition-[width] duration-300 ease-out" : "w-1/5 animate-pulse",
+          )}
+          style={progress ? { width: `${Math.min(100, Math.max(percent, 2))}%` } : undefined}
+        />
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-3 text-[11px] font-mono text-terminal-muted">
+        <span>{percent}%</span>
+        {progress && progress.total > 1 ? <span>{progress.done}/{progress.total}</span> : null}
+        <span>已用时 {elapsed} 秒</span>
+      </div>
+      {view === "prev" ? (
+        <div className="mt-2 text-[11px] text-terminal-muted">
+          首次需按代码拉取日 K 与当日净值，可能需要一两分钟；完成后会写入本地缓存，之后打开该交易日无需再请求。
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function MarketTerminal() {
   const [view, setView] = useState<MarketView>("today");
   const [liveData, setLiveData] = useState<MarketPayload | null>(null);
   const [prevData, setPrevData] = useState<MarketPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [progress, setProgress] = useState<LoadProgress | null>(null);
+  const [loadStartedAt, setLoadStartedAt] = useState<number | null>(null);
+  const [nowTick, setNowTick] = useState(0);
+  const hasLiveRef = useRef(false);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [sortKey, setSortKey] = useState<ColumnKey>("turnover");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
@@ -260,34 +314,42 @@ export function MarketTerminal() {
 
   const data = view === "prev" ? prevData : liveData;
 
-  const loadLive = useCallback(async () => {
+  const loadLive = useCallback(async (opts?: { stream?: boolean; signal?: AbortSignal }) => {
     try {
       setError(null);
-      const res = await fetch("/api/market", { cache: "no-store" });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "行情加载失败");
+      const json = opts?.stream
+        ? await fetchMarketStream("/api/market?stream=1", setProgress, opts.signal)
+        : await (async () => {
+            const res = await fetch("/api/market", { cache: "no-store", signal: opts?.signal });
+            const body = await res.json();
+            if (!res.ok) throw new Error(body.error || "行情加载失败");
+            return body as MarketPayload;
+          })();
+      if (opts?.signal?.aborted) return;
+      hasLiveRef.current = true;
       setLiveData(json);
     } catch (err) {
+      if (opts?.signal?.aborted || isAbortError(err)) return;
       setError(err instanceof Error ? err.message : "行情加载失败");
     } finally {
-      setLoading(false);
+      if (!opts?.signal?.aborted) setLoading(false);
     }
   }, []);
 
-  const loadPrev = useCallback(async () => {
+  const loadPrev = useCallback(async (signal?: AbortSignal) => {
     const today = shanghaiDateString();
     try {
       setError(null);
       const cached = await readPrevCloseCache();
+      if (signal?.aborted) return;
       if (isPrevCloseCacheFresh(cached, today) && cached) {
         setPrevData(cached.payload);
         setLoading(false);
         return;
       }
       setLoading(true);
-      const res = await fetch("/api/market?view=prev", { cache: "no-store" });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "上一交易日收盘快照加载失败");
+      const json = await fetchMarketStream("/api/market?view=prev&stream=1", setProgress, signal);
+      if (signal?.aborted) return;
       setPrevData(json);
       if (json?.asOfDate && Array.isArray(json.list)) {
         await writePrevCloseCache({
@@ -298,26 +360,42 @@ export function MarketTerminal() {
         });
       }
     } catch (err) {
+      if (signal?.aborted || isAbortError(err)) return;
       setError(err instanceof Error ? err.message : "上一交易日收盘快照加载失败");
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) setLoading(false);
     }
   }, []);
 
   const load = useCallback(() => {
-    return view === "prev" ? loadPrev() : loadLive();
+    setProgress(null);
+    setLoadStartedAt(Date.now());
+    return view === "prev" ? loadPrev() : loadLive({ stream: !hasLiveRef.current });
   }, [view, loadPrev, loadLive]);
 
   useEffect(() => {
+    const ac = new AbortController();
     setLoading(true);
+    setProgress(null);
+    setLoadStartedAt(Date.now());
     if (view === "today") {
-      loadLive();
-      const id = window.setInterval(loadLive, 15000);
-      return () => window.clearInterval(id);
+      void loadLive({ stream: !hasLiveRef.current, signal: ac.signal });
+      const id = window.setInterval(() => void loadLive({ stream: false }), 15000);
+      return () => {
+        ac.abort();
+        window.clearInterval(id);
+      };
     }
-    loadPrev();
-    return undefined;
+    void loadPrev(ac.signal);
+    return () => ac.abort();
   }, [view, loadLive, loadPrev]);
+
+  useEffect(() => {
+    if (!loading || data) return;
+    setNowTick(Date.now());
+    const id = window.setInterval(() => setNowTick(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [loading, data]);
 
   const updateFilter = <K extends keyof Filters>(key: K, value: Filters[K]) => {
     setFilters((prev) => ({ ...prev, [key]: value }));
@@ -338,7 +416,9 @@ export function MarketTerminal() {
       if (idx) {
         const indexName = (row.indexName ?? "").toLowerCase();
         const indexCode = (row.indexCode ?? "").toLowerCase();
-        if (!indexName.includes(idx) && !indexCode.includes(idx)) return false;
+        const indexHit = indexName.includes(idx) || indexCode.includes(idx);
+        const codeHit = /^\d{6}$/.test(idx) && row.code.toLowerCase() === idx;
+        if (!indexHit && !codeHit) return false;
       }
       if (!matchChange(row.changePct, filters.changeBucket)) return false;
       if (!matchPremium(row.premiumPct, filters.premiumBucket)) return false;
@@ -474,17 +554,13 @@ export function MarketTerminal() {
         <div className="m-3 border border-up/40 bg-up/10 px-3 py-2 text-sm text-up">加载失败：{error}。页面不会用模拟数据替代真实行情。</div>
       ) : null}
       {loading && !data ? (
-        <div className="px-3 py-10 text-sm text-terminal-muted">
-          {view === "prev"
-            ? "正在构建上一交易日收盘快照。首次需按代码拉取日 K，可能需要一两分钟；完成后会写入本地缓存，之后打开该交易日无需再请求。"
-            : "正在从服务端拉取沪深场内 ETF 全量行情…"}
-        </div>
+        <LoadProgressPanel view={view} progress={progress} startedAt={loadStartedAt} now={nowTick} />
       ) : null}
 
       {ov ? (
         <>
           <section className="flex flex-wrap border-b border-terminal-border">
-            <HeaderStat label="ETF 数量" value={String(ov.totalCount)} sub={`正常上市 ${ov.listedCount}${ov.noQuoteCount ? ` · 无行情 ${ov.noQuoteCount}` : ""}${ov.pausedCount ? ` · 暂停 ${ov.pausedCount}` : ""}`} />
+            <HeaderStat label="ETF 数量" value={String(ov.totalCount)} sub={`正常上市 ${ov.listedCount}${ov.haltedCount ? ` · 停牌 ${ov.haltedCount}` : ""}${ov.noQuoteCount ? ` · 无行情 ${ov.noQuoteCount}` : ""}${ov.pausedCount ? ` · 暂停 ${ov.pausedCount}` : ""}`} />
             <HeaderStat
               label="总规模（已披露）"
               value={formatAum(ov.totalAum)}
@@ -611,7 +687,7 @@ export function MarketTerminal() {
             <input
               value={filters.indexQuery}
               onChange={(e) => updateFilter("indexQuery", e.target.value)}
-              placeholder="名称或代码"
+              placeholder="指数名称/代码，也可填基金代码"
               className="h-8 w-40 border border-terminal-border bg-terminal-panel px-2 font-mono text-sm"
             />
           </label>
@@ -760,9 +836,18 @@ export function MarketTerminal() {
                   </td>
                   {COLUMNS.filter((c) => visible.includes(c.key)).map((c) => {
                     const colored = ["change", "changePct", "premiumPct", "ret5d", "ret20d", "ret60d", "ret1y", "ytdChangePct"].includes(c.key);
+                    const statusMuted =
+                      (c.key === "last" || c.key === "status") &&
+                      (row.status === "停牌" || row.status === "暂停交易" || row.status === "无行情" || row.status === "终止上市");
                     const href = `/etf/${row.code}?market=${row.market}`;
                     const inner = (
-                      <span className={cn(c.numeric && "font-mono tabular-nums", colored && changeClass(row[c.key] as number | null))}>
+                      <span
+                        className={cn(
+                          c.numeric && "font-mono tabular-nums",
+                          statusMuted && "text-terminal-muted",
+                          !statusMuted && colored && changeClass(row[c.key] as number | null),
+                        )}
+                      >
                         {cellValue(row, c.key)}
                         {c.key === "aum" && row.aumDate ? (
                           <span className="ml-1 text-[10px] text-terminal-muted">{row.aumDate}</span>

@@ -5,6 +5,7 @@ import { getMarketProvider } from "../providers";
 import type { QuoteRaw } from "../providers/types";
 import { findBarOnDate, periodReturnFromBars, yearReturnFromBars, ytdChangePctFromBars } from "../returns";
 import type { KlineBar, MarketPayload } from "../types";
+import { stagePercent, throttleProgress, type LoadProgress } from "../load-progress";
 import { buildCategories, buildOverview, ensureF10Ready, getCachedF10, loadQuotes, mergeRow } from "./market-service";
 
 const PREV_TTL_MS = 36 * 60 * 60 * 1000;
@@ -15,6 +16,13 @@ const CACHE_FILE_PREFIX = `prev-close-v${PREV_CLOSE_PAYLOAD_VERSION}`;
 
 let building: Promise<MarketPayload> | null = null;
 let buildingDate: string | null = null;
+const progressListeners = new Set<(p: LoadProgress) => void>();
+let lastBuildProgress: LoadProgress | null = null;
+
+function emitBuildProgress(p: LoadProgress) {
+  lastBuildProgress = p;
+  for (const listener of progressListeners) listener(p);
+}
 
 async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const out = new Array<R>(items.length);
@@ -120,15 +128,49 @@ function quoteFromBars(base: QuoteRaw, bars: KlineBar[], asOfDate: string, quote
   };
 }
 
-async function buildPrevClosePayload(asOfDate: string): Promise<MarketPayload> {
+async function buildPrevClosePayload(asOfDate: string, onProgress?: (p: LoadProgress) => void): Promise<MarketPayload> {
   const provider = getMarketProvider();
+  onProgress?.({
+    stage: "universe",
+    label: "正在准备基金列表…",
+    done: 0,
+    total: 1,
+    percent: 4,
+  });
   const universe = await loadQuotes();
-  await ensureF10Ready(universe.quotes.map((q) => q.code));
+  onProgress?.({
+    stage: "universe",
+    label: `已获取 ${universe.quotes.length} 只，正在补齐基金资料…`,
+    done: 1,
+    total: 1,
+    percent: 8,
+  });
+  await ensureF10Ready(
+    universe.quotes.map((q) => q.code),
+    (done, total) =>
+      onProgress?.({
+        stage: "f10",
+        label: "正在补齐基金资料（规模、运作费率、跟踪指数）…",
+        done,
+        total,
+        percent: stagePercent(8, 15, done, total),
+      }),
+  );
   const quoteTime = shanghaiSessionCloseUnix(asOfDate);
   let klineOk = 0;
   let klineFail = 0;
   let traded = 0;
   let navOk = 0;
+  const total = universe.quotes.length;
+  let completed = 0;
+  const reportKline = throttleProgress((p) => onProgress?.(p), 200);
+  reportKline({
+    stage: "klines",
+    label: "正在拉取日K与当日净值…",
+    done: 0,
+    total,
+    percent: 15,
+  });
 
   const quotes = await mapPool(universe.quotes, KLINE_CONCURRENCY, async (base) => {
     const [klineResult, officialNav] = await Promise.all([
@@ -139,14 +181,32 @@ async function buildPrevClosePayload(asOfDate: string): Promise<MarketPayload> {
       provider.fetchOfficialNav(base.code, asOfDate).catch(() => null),
     ]);
     if (officialNav) navOk += 1;
+    let row: { q: QuoteRaw; officialNav: typeof officialNav };
     if (!klineResult.ok || !klineResult.bars) {
       klineFail += 1;
-      return { q: emptyQuote(base, quoteTime), officialNav };
+      row = { q: emptyQuote(base, quoteTime), officialNav };
+    } else {
+      klineOk += 1;
+      const q = quoteFromBars(base, klineResult.bars, asOfDate, quoteTime);
+      if (q.last !== null) traded += 1;
+      row = { q, officialNav };
     }
-    klineOk += 1;
-    const q = quoteFromBars(base, klineResult.bars, asOfDate, quoteTime);
-    if (q.last !== null) traded += 1;
-    return { q, officialNav };
+    completed += 1;
+    reportKline({
+      stage: "klines",
+      label: "正在拉取日K与当日净值…",
+      done: completed,
+      total,
+      percent: stagePercent(15, 96, completed, total),
+    });
+    return row;
+  });
+  onProgress?.({
+    stage: "assemble",
+    label: "正在生成收盘快照…",
+    done: 1,
+    total: 1,
+    percent: 98,
   });
 
   const list = quotes.map(({ q, officialNav }) => {
@@ -179,7 +239,7 @@ async function buildPrevClosePayload(asOfDate: string): Promise<MarketPayload> {
     "该快照按收盘日期缓存在服务端（内存与本地文件）以及浏览器本地，不按 15 秒轮询。",
   ];
 
-  return {
+  const payload: MarketPayload = {
     source: `${provider.label}（上一交易日收盘）`,
     fetchedAt: Math.floor(Date.now() / 1000),
     quoteTime,
@@ -196,21 +256,56 @@ async function buildPrevClosePayload(asOfDate: string): Promise<MarketPayload> {
     view: "prev-close",
     asOfDate,
   };
+  onProgress?.({
+    stage: "assemble",
+    label: "收盘快照已就绪",
+    done: 1,
+    total: 1,
+    percent: 100,
+  });
+  return payload;
 }
 
-export async function getPrevClosePayload(): Promise<MarketPayload> {
+export async function getPrevClosePayload(onProgress?: (p: LoadProgress) => void): Promise<MarketPayload> {
+  onProgress?.({
+    stage: "asOfDate",
+    label: "正在确定上一交易日…",
+    done: 0,
+    total: 1,
+    percent: 1,
+  });
   const asOfDate = await resolvePrevTradeDate();
+  onProgress?.({
+    stage: "asOfDate",
+    label: `上一交易日为 ${asOfDate}，正在检查缓存…`,
+    done: 1,
+    total: 1,
+    percent: 3,
+  });
   const memKey = `${CACHE_FILE_PREFIX}:${asOfDate}`;
   const cached = memoryGet<MarketPayload>(memKey);
-  if (cached?.asOfDate === asOfDate && cached.payloadVersion === PREV_CLOSE_PAYLOAD_VERSION && cached.list?.length) return cached;
+  if (cached?.asOfDate === asOfDate && cached.payloadVersion === PREV_CLOSE_PAYLOAD_VERSION && cached.list?.length) {
+    onProgress?.({ stage: "cached", label: "已命中服务端缓存", done: 1, total: 1, percent: 100 });
+    return cached;
+  }
   const file = readJsonFile<MarketPayload>(`${CACHE_FILE_PREFIX}-${asOfDate}.json`);
   if (file?.asOfDate === asOfDate && file.payloadVersion === PREV_CLOSE_PAYLOAD_VERSION && file.list?.length) {
     memorySet(memKey, file, PREV_TTL_MS);
+    onProgress?.({ stage: "cached", label: "已命中服务端缓存", done: 1, total: 1, percent: 100 });
     return file;
   }
-  if (building && buildingDate === asOfDate) return building;
+  if (building && buildingDate === asOfDate) {
+    if (lastBuildProgress) onProgress?.(lastBuildProgress);
+    if (onProgress) progressListeners.add(onProgress);
+    try {
+      return await building;
+    } finally {
+      if (onProgress) progressListeners.delete(onProgress);
+    }
+  }
+  if (onProgress) progressListeners.add(onProgress);
   buildingDate = asOfDate;
-  building = buildPrevClosePayload(asOfDate)
+  building = buildPrevClosePayload(asOfDate, emitBuildProgress)
     .then((payload) => {
       memorySet(memKey, payload, PREV_TTL_MS);
       writeJsonFile(`${CACHE_FILE_PREFIX}-${asOfDate}.json`, payload);
@@ -219,6 +314,12 @@ export async function getPrevClosePayload(): Promise<MarketPayload> {
     .finally(() => {
       building = null;
       buildingDate = null;
+      progressListeners.clear();
+      lastBuildProgress = null;
     });
-  return building;
+  try {
+    return await building;
+  } finally {
+    if (onProgress) progressListeners.delete(onProgress);
+  }
 }

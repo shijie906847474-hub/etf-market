@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { changeClass, formatMoney, formatPct, formatPrice, formatShanghai } from "@/lib/format";
+import { changeClass, formatMoney, formatPct, formatPrice, formatShanghai, lastPriceLabel } from "@/lib/format";
 import type { EtfRow, MarketPayload } from "@/lib/types";
 import { loadWatchlist, saveWatchlist, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
@@ -178,11 +178,21 @@ export function WatchlistView() {
                       <span className="text-terminal-muted">{data ? "清单中未找到" : "行情加载中"}</span>
                     )}
                   </td>
-                  <td className={cn("px-2 py-1 text-right font-mono", changeClass(row?.changePct ?? null))}>
-                    {formatPrice(row?.last ?? null)}
+                  <td
+                    className={cn(
+                      "px-2 py-1 text-right font-mono",
+                      row && row.status !== "正常上市" ? "text-terminal-muted" : changeClass(row?.changePct ?? null),
+                    )}
+                  >
+                    {row ? lastPriceLabel(row) : "—"}
                   </td>
-                  <td className={cn("px-2 py-1 text-right font-mono", changeClass(row?.changePct ?? null))}>
-                    {formatPct(row?.changePct ?? null)}
+                  <td
+                    className={cn(
+                      "px-2 py-1 text-right font-mono",
+                      row && row.status !== "正常上市" ? "text-terminal-muted" : changeClass(row?.changePct ?? null),
+                    )}
+                  >
+                    {row && row.status !== "正常上市" ? row.status : formatPct(row?.changePct ?? null)}
                   </td>
                   <td className="px-2 py-1 text-right font-mono">{formatMoney(row?.turnover ?? null)}</td>
                   <td className="px-2 py-1">

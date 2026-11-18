@@ -208,9 +208,11 @@ export function classifyEtf(profile: FundProfile | null): EtfCategory {
   return "其他";
 }
 
-export function detectStatus(name: string, last: number | null): TradeStatus {
+export function detectStatus(name: string, last: number | null, statusHint?: number | null): TradeStatus {
   if (/退市|摘牌/.test(name)) return "终止上市";
   if (/暂停/.test(name)) return "暂停交易";
+  // 东方财富 clist f107：2=正常，5=停牌。stock/get 的 f107 含义不同，不能混用。
+  if (statusHint === 5) return "停牌";
   if (last === null) return "无行情";
   return "正常上市";
 }

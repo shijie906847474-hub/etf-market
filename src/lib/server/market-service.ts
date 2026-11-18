@@ -14,6 +14,8 @@ import type {
   MarketPayload,
 } from "../types";
 import { ALL_CATEGORIES } from "../types";
+import type { LoadProgress } from "../load-progress";
+import { stagePercent } from "../load-progress";
 
 const QUOTE_TTL_MS = 12_000;
 const F10_TTL_MS = 18 * 60 * 60 * 1000;
@@ -35,8 +37,21 @@ function premiumPct(last: number | null, iopv: number | null): number | null {
 }
 
 
+function hasSessionTrade(q: import("../providers/types").QuoteRaw): boolean {
+  return (q.volume != null && q.volume > 0) || (q.turnover != null && q.turnover > 0) || q.open != null;
+}
+
 export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundProfile, iopv?: IopvSnapshot): EtfRow {
-  const last = q.last;
+  let last = q.last;
+  let change = q.change;
+  let changePct = q.changePct;
+  const status = detectStatus(q.name, last, q.statusHint);
+  // 深市停牌时，clist 常把昨收原样填进最新价且成交量为空。这不是今价，不能展示成正在交易。
+  if (status === "停牌" && !hasSessionTrade(q)) {
+    last = null;
+    change = null;
+    changePct = null;
+  }
   const category = classifyEtf(f10 ?? null);
   const spread =
     q.ask1 !== null && q.bid1 !== null ? Number((q.ask1 - q.bid1).toFixed(6)) : null;
@@ -47,10 +62,10 @@ export function mergeRow(q: import("../providers/types").QuoteRaw, f10?: FundPro
     secid: `${q.market}.${q.code}`,
     exchange: q.market === 1 ? "SH" : "SZ",
     category,
-    status: detectStatus(q.name, last),
+    status,
     last,
-    change: q.change,
-    changePct: q.changePct,
+    change,
+    changePct,
     turnover: q.turnover,
     volume: q.volume,
     amplitude: q.amplitude,
@@ -100,16 +115,32 @@ export function getCachedF10(code: string): FundProfile | undefined {
   return f10Memory[code];
 }
 
-export async function ensureF10Ready(codes: string[]) {
+export async function ensureF10Ready(codes: string[], onProgress?: (done: number, total: number) => void) {
   const stale = codes.filter((c) => !f10Fresh(f10Memory[c])).length;
-  if (stale === 0) return;
+  if (stale === 0) {
+    onProgress?.(codes.length, codes.length);
+    return;
+  }
   if (!f10Warming) {
     f10Warming = warmF10(codes).finally(() => {
       f10Warming = null;
     });
   }
   if (Object.keys(f10Memory).length < codes.length * 0.9) {
-    await Promise.race([f10Warming, new Promise((r) => setTimeout(r, 55000))]);
+    const started = Date.now();
+    const tick = () => {
+      const fresh = codes.filter((c) => f10Fresh(f10Memory[c])).length;
+      onProgress?.(fresh, codes.length);
+    };
+    tick();
+    while (Date.now() - started < 55000 && Object.keys(f10Memory).length < codes.length * 0.9) {
+      const inflight = f10Warming;
+      if (!inflight) break;
+      await Promise.race([inflight, new Promise((r) => setTimeout(r, 400))]);
+      tick();
+    }
+  } else {
+    onProgress?.(codes.filter((c) => Boolean(f10Memory[c])).length, codes.length);
   }
 }
 
@@ -215,6 +246,7 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   const surged = active.filter(
     (x) =>
       x.status !== "暂停交易" &&
+      x.status !== "停牌" &&
       x.volumeRatio !== null &&
       x.volumeRatio >= VOLUME_RATIO_SURGE &&
       x.changePct !== null,
@@ -237,6 +269,7 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   return {
     totalCount: list.length,
     listedCount: list.filter((x) => x.status === "正常上市").length,
+    haltedCount: list.filter((x) => x.status === "停牌").length,
     pausedCount: list.filter((x) => x.status === "暂停交易").length,
     delistedCount: list.filter((x) => x.status === "终止上市").length,
     noQuoteCount: list.filter((x) => x.status === "无行情").length,
@@ -266,19 +299,43 @@ export async function loadQuotes() {
   return wrapped;
 }
 
-export async function getMarketPayload(): Promise<MarketPayload> {
+export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): Promise<MarketPayload> {
+  onProgress?.({
+    stage: "universe",
+    label: "正在拉取沪深场内 ETF 行情列表…",
+    done: 0,
+    total: 1,
+    percent: 5,
+  });
   const quotes = await loadQuotes();
-  const staleF10 = quotes.quotes.filter((q) => !f10Fresh(f10Memory[q.code])).length;
-  if (staleF10 > 0) {
-    if (!f10Warming) f10Warming = warmF10(quotes.quotes.map((q) => q.code)).finally(() => (f10Warming = null));
-    if (Object.keys(f10Memory).length < quotes.quotes.length * 0.9) {
-      await Promise.race([f10Warming, new Promise((r) => setTimeout(r, 55000))]);
-    }
-  }
+  onProgress?.({
+    stage: "universe",
+    label: `已获取 ${quotes.quotes.length} 只行情，正在检查基金资料…`,
+    done: 1,
+    total: 1,
+    percent: 20,
+  });
+  const codes = quotes.quotes.map((q) => q.code);
+  await ensureF10Ready(codes, (done, total) => {
+    onProgress?.({
+      stage: "f10",
+      label: "正在补齐基金资料（规模、运作费率、跟踪指数）…",
+      done,
+      total,
+      percent: stagePercent(20, 90, done, total),
+    });
+  });
   ensureWarmers(
-    quotes.quotes.map((q) => q.code),
+    codes,
     quotes.quotes.map((q) => ({ code: q.code, secid: `${q.market}.${q.code}` })),
   );
+  onProgress?.({
+    stage: "assemble",
+    label: "正在整理全市场行情…",
+    done: 1,
+    total: 1,
+    percent: 96,
+  });
 
   const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code]));
   const f10Coverage = list.filter((x) => x.fundType).length;
@@ -304,7 +361,7 @@ export async function getMarketPayload(): Promise<MarketPayload> {
   if (f10Coverage < list.length) {
     notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}，缺失资料的品种暂归入「其他」，不会仅按名称强行分类。`);
   }
-  return {
+  const payload: MarketPayload = {
     source: getMarketProvider().label,
     fetchedAt: Math.floor(quotes.fetchedAt / 1000),
     quoteTime,
@@ -319,6 +376,14 @@ export async function getMarketPayload(): Promise<MarketPayload> {
     view: "live",
     asOfDate: null,
   };
+  onProgress?.({
+    stage: "assemble",
+    label: "行情已就绪",
+    done: 1,
+    total: 1,
+    percent: 100,
+  });
+  return payload;
 }
 
 function riskWarnings(row: EtfRow): { level: "info" | "warn"; text: string }[] {
@@ -360,7 +425,15 @@ function riskWarnings(row: EtfRow): { level: "info" | "warn"; text: string }[] {
       });
     }
   }
-  if (row.status === "无行情" || row.status === "暂停交易") {
+  if (row.status === "停牌") {
+    out.push({
+      level: "warn",
+      text:
+        row.last == null
+          ? "当前交易状态：停牌，今日尚未成交，价格按缺失展示，不会用昨收填补。"
+          : "当前交易状态：停牌，最新价为停牌前最后成交价。",
+    });
+  } else if (row.status === "无行情" || row.status === "暂停交易") {
     out.push({ level: "warn", text: `当前交易状态：${row.status}，价格字段按缺失展示，不会用 0 填充。` });
   }
   return out;

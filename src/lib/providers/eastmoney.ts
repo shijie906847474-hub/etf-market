@@ -144,6 +144,7 @@ function mapQuote(row: Record<string, unknown>): QuoteRaw | null {
     // 用日 K fqt=1 按 (session_close / last_close_of_previous_year)-1 核对，与 f25 一致；
     // 同期 f127 为 -0.27/1.41/2.41/5.47，与该公式（约 -11.1/-21.0/16.1/25.3）不符，故不用 f127。
     ytdChangePct: toNum(row.f25),
+    // clist f107：2=正常，5=停牌。不要用 stock/get 的 f107。
     statusHint: toNum(row.f107),
   };
 }

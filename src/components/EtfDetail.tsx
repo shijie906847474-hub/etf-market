@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { QuoteChart } from "@/components/QuoteChart";
-import { changeClass, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands } from "@/lib/format";
+import { changeClass, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands, lastPriceLabel } from "@/lib/format";
 import type { EtfDetailPayload, KlineBar, TrendPoint } from "@/lib/types";
 import { isWatched, loadWatchlist, saveWatchlist, toggleWatch } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
@@ -107,9 +107,16 @@ export function EtfDetail({ code, market }: { code: string; market?: string }) {
                 </div>
                 <h1 className="text-xl font-medium">{row.name}</h1>
               </div>
-              <div className={cn("font-mono text-3xl tabular-nums", changeClass(row.changePct))}>{formatPrice(row.last)}</div>
-              <div className={cn("font-mono text-lg", changeClass(row.changePct))}>
-                {formatPrice(row.change)} {formatPct(row.changePct)}
+              <div
+                className={cn(
+                  "font-mono text-3xl tabular-nums",
+                  row.status === "正常上市" ? changeClass(row.changePct) : "text-terminal-muted",
+                )}
+              >
+                {lastPriceLabel(row)}
+              </div>
+              <div className={cn("font-mono text-lg", row.status === "正常上市" ? changeClass(row.changePct) : "text-terminal-muted")}>
+                {row.status === "正常上市" ? `${formatPrice(row.change)} ${formatPct(row.changePct)}` : row.status}
               </div>
               <button
                 type="button"

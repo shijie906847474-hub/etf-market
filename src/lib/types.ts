@@ -8,7 +8,7 @@ export type EtfCategory =
   | "货币"
   | "其他";
 
-export type TradeStatus = "正常上市" | "暂停交易" | "终止上市" | "无行情";
+export type TradeStatus = "正常上市" | "停牌" | "暂停交易" | "终止上市" | "无行情";
 
 export type DataFreshness = "交易时段（公开行情，可能延迟）" | "已收盘（日终行情）" | "非交易时段" | "接口异常";
 
@@ -111,6 +111,7 @@ export interface CategoryStat {
 export interface MarketOverview {
   totalCount: number;
   listedCount: number;
+  haltedCount: number;
   pausedCount: number;
   delistedCount: number;
   noQuoteCount: number;
