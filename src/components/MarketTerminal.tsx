@@ -66,20 +66,13 @@ interface Filters {
   category: "全部" | EtfCategory;
   changeBucket: string;
   premiumBucket: string;
-  turnoverMin: string;
-  turnoverMax: string;
-  aumMin: string;
-  aumMax: string;
-  ret5Min: string;
-  ret5Max: string;
-  ret20Min: string;
-  ret20Max: string;
-  turnoverRateMin: string;
-  turnoverRateMax: string;
-  volumeRatioMin: string;
-  volumeRatioMax: string;
-  feeMin: string;
-  feeMax: string;
+  turnoverBucket: string;
+  aumBucket: string;
+  ret5Bucket: string;
+  ret20Bucket: string;
+  turnoverRateBucket: string;
+  volumeRatioBucket: string;
+  feeBucket: string;
   indexQuery: string;
   theme: string;
 }
@@ -89,36 +82,96 @@ const EMPTY_FILTERS: Filters = {
   category: "全部",
   changeBucket: "",
   premiumBucket: "",
-  turnoverMin: "",
-  turnoverMax: "",
-  aumMin: "",
-  aumMax: "",
-  ret5Min: "",
-  ret5Max: "",
-  ret20Min: "",
-  ret20Max: "",
-  turnoverRateMin: "",
-  turnoverRateMax: "",
-  volumeRatioMin: "",
-  volumeRatioMax: "",
-  feeMin: "",
-  feeMax: "",
+  turnoverBucket: "",
+  aumBucket: "",
+  ret5Bucket: "",
+  ret20Bucket: "",
+  turnoverRateBucket: "",
+  volumeRatioBucket: "",
+  feeBucket: "",
   indexQuery: "",
   theme: "",
 };
 
-function numOrNull(s: string): number | null {
-  if (s.trim() === "") return null;
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+type RangeBucket = { value: string; label: string; min: number | null; max: number | null };
+
+const TURNOVER_BUCKETS: RangeBucket[] = [
+  { value: "lt500", label: "小于 500万", min: null, max: 500 },
+  { value: "500to2000", label: "500万～2000万", min: 500, max: 2000 },
+  { value: "2000to10000", label: "2000万～1亿", min: 2000, max: 10000 },
+  { value: "10000to50000", label: "1亿～5亿", min: 10000, max: 50000 },
+  { value: "ge50000", label: "超过 5亿", min: 50000, max: null },
+];
+
+const AUM_BUCKETS: RangeBucket[] = [
+  { value: "lt2", label: "小于 2亿", min: null, max: 2 },
+  { value: "2to10", label: "2亿～10亿", min: 2, max: 10 },
+  { value: "10to50", label: "10亿～50亿", min: 10, max: 50 },
+  { value: "50to200", label: "50亿～200亿", min: 50, max: 200 },
+  { value: "ge200", label: "超过 200亿", min: 200, max: null },
+];
+
+const TURNOVER_RATE_BUCKETS: RangeBucket[] = [
+  { value: "lt05", label: "低于 0.5%", min: null, max: 0.5 },
+  { value: "05to1", label: "0.5%～1%", min: 0.5, max: 1 },
+  { value: "1to2", label: "1%～2%", min: 1, max: 2 },
+  { value: "2to5", label: "2%～5%", min: 2, max: 5 },
+  { value: "ge5", label: "超过 5%", min: 5, max: null },
+];
+
+const VOLUME_RATIO_BUCKETS: RangeBucket[] = [
+  { value: "lt05", label: "低于 0.50", min: null, max: 0.5 },
+  { value: "05to1", label: "0.50～1.00", min: 0.5, max: 1 },
+  { value: "1to15", label: "1.00～1.50", min: 1, max: 1.5 },
+  { value: "15to3", label: "1.50～3.00", min: 1.5, max: 3 },
+  { value: "ge3", label: "超过 3.00", min: 3, max: null },
+];
+
+const FEE_BUCKETS: RangeBucket[] = [
+  { value: "lt02", label: "低于 0.20%", min: null, max: 0.2 },
+  { value: "02to04", label: "0.20%～0.40%", min: 0.2, max: 0.4 },
+  { value: "04to06", label: "0.40%～0.60%", min: 0.4, max: 0.6 },
+  { value: "06to10", label: "0.60%～1.00%", min: 0.6, max: 1 },
+  { value: "ge10", label: "超过 1.00%", min: 1, max: null },
+];
+
+const CHANGE_OPTIONS: Array<[string, string]> = [
+  ["", "全部"],
+  ["up5", "涨幅超过 5%"],
+  ["up2to5", "涨幅 2%～5%"],
+  ["up0to2", "涨幅 0%～2%"],
+  ["down0to2", "跌幅 0%～2%"],
+  ["down2to5", "跌幅 2%～5%"],
+  ["down5", "跌幅超过 5%"],
+];
+
+const RET20_OPTIONS: Array<[string, string]> = [
+  ["", "全部"],
+  ["up10", "涨幅超过 10%"],
+  ["up5to10", "涨幅 5%～10%"],
+  ["up0to5", "涨幅 0%～5%"],
+  ["down0to5", "跌幅 0%～5%"],
+  ["down5to10", "跌幅 5%～10%"],
+  ["down10", "跌幅超过 10%"],
+];
+
+function bucketOptions(rows: RangeBucket[]): Array<[string, string]> {
+  return [["", "全部"], ...rows.map((r) => [r.value, r.label] as [string, string])];
 }
 
-function inRange(value: number | null, min: number | null, max: number | null): boolean {
+function inBucket(value: number | null, min: number | null, max: number | null): boolean {
   if (min === null && max === null) return true;
   if (value === null) return false;
   if (min !== null && value < min) return false;
-  if (max !== null && value > max) return false;
+  if (max !== null && value >= max) return false;
   return true;
+}
+
+function matchRangeBucket(value: number | null, bucket: string, rows: RangeBucket[]): boolean {
+  if (!bucket) return true;
+  const row = rows.find((r) => r.value === bucket);
+  if (!row) return true;
+  return inBucket(value, row.min, row.max);
 }
 
 function matchChange(v: number | null, bucket: string): boolean {
@@ -137,6 +190,27 @@ function matchChange(v: number | null, bucket: string): boolean {
       return v <= -2 && v >= -5;
     case "down5":
       return v < -5;
+    default:
+      return true;
+  }
+}
+
+function matchRet20(v: number | null, bucket: string): boolean {
+  if (!bucket) return true;
+  if (v === null) return false;
+  switch (bucket) {
+    case "up10":
+      return v > 10;
+    case "up5to10":
+      return v >= 5 && v <= 10;
+    case "up0to5":
+      return v >= 0 && v < 5;
+    case "down0to5":
+      return v < 0 && v > -5;
+    case "down5to10":
+      return v <= -5 && v >= -10;
+    case "down10":
+      return v < -10;
     default:
       return true;
   }
@@ -323,7 +397,11 @@ export function MarketTerminal() {
     try {
       setError(null);
       const json = opts?.stream
-        ? await fetchMarketStream("/api/market?stream=1", setProgress, opts.signal)
+        ? await fetchMarketStream("/api/market?stream=1", setProgress, opts.signal, (partial) => {
+            hasLiveRef.current = true;
+            setLiveData(partial);
+            setLoading(false);
+          })
         : await (async () => {
             const res = await fetch("/api/market", { cache: "no-store", signal: opts?.signal });
             const body = await res.json();
@@ -388,13 +466,6 @@ export function MarketTerminal() {
     }
   }, []);
 
-  const load = useCallback(() => {
-    if (view === "settings") return;
-    setProgress(null);
-    setLoadStartedAt(Date.now());
-    return view === "history" ? loadHistory(historyDate, undefined, true) : loadLive({ stream: !hasLiveRef.current });
-  }, [view, historyDate, loadHistory, loadLive]);
-
   useEffect(() => {
     if (view === "settings") {
       setLoading(false);
@@ -408,7 +479,10 @@ export function MarketTerminal() {
     setLoadStartedAt(Date.now());
     if (view === "today") {
       void loadLive({ stream: !hasLiveRef.current, signal: ac.signal });
-      const id = window.setInterval(() => void loadLive({ stream: false }), 15000);
+      const id = window.setInterval(() => {
+        if (!hasLiveRef.current) return;
+        void loadLive({ stream: false });
+      }, 15000);
       return () => {
         ac.abort();
         window.clearInterval(id);
@@ -478,6 +552,20 @@ export function MarketTerminal() {
     return opts;
   }, [data]);
 
+  const themeOptions = useMemo(() => {
+    const opts: Array<[string, string]> = [["", "全部"]];
+    if (!data) return opts;
+    const counts = new Map<string, number>();
+    for (const row of data.list) {
+      if (row.status === "终止上市") continue;
+      const theme = classifyTheme(row);
+      counts.set(theme, (counts.get(theme) ?? 0) + 1);
+    }
+    const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-CN"));
+    for (const [name, count] of sorted) opts.push([name, `${name}（${count}）`]);
+    return opts;
+  }, [data]);
+
   const filtered = useMemo(() => {
     if (!data) return [];
     const q = filters.search.trim().toLowerCase();
@@ -494,14 +582,13 @@ export function MarketTerminal() {
       }
       if (!matchChange(row.changePct, filters.changeBucket)) return false;
       if (!matchPremium(row.premiumPct, filters.premiumBucket)) return false;
-      if (!inRange(row.turnover === null ? null : row.turnover / 1e4, numOrNull(filters.turnoverMin), numOrNull(filters.turnoverMax)))
-        return false;
-      if (!inRange(row.aum === null ? null : row.aum / 1e8, numOrNull(filters.aumMin), numOrNull(filters.aumMax))) return false;
-      if (!inRange(row.ret5d, numOrNull(filters.ret5Min), numOrNull(filters.ret5Max))) return false;
-      if (!inRange(row.ret20d, numOrNull(filters.ret20Min), numOrNull(filters.ret20Max))) return false;
-      if (!inRange(row.turnoverRate, numOrNull(filters.turnoverRateMin), numOrNull(filters.turnoverRateMax))) return false;
-      if (!inRange(row.volumeRatio, numOrNull(filters.volumeRatioMin), numOrNull(filters.volumeRatioMax))) return false;
-      if (!inRange(row.operatingFee, numOrNull(filters.feeMin), numOrNull(filters.feeMax))) return false;
+      if (!matchRangeBucket(row.turnover === null ? null : row.turnover / 1e4, filters.turnoverBucket, TURNOVER_BUCKETS)) return false;
+      if (!matchRangeBucket(row.aum === null ? null : row.aum / 1e8, filters.aumBucket, AUM_BUCKETS)) return false;
+      if (!matchChange(row.ret5d, filters.ret5Bucket)) return false;
+      if (!matchRet20(row.ret20d, filters.ret20Bucket)) return false;
+      if (!matchRangeBucket(row.turnoverRate, filters.turnoverRateBucket, TURNOVER_RATE_BUCKETS)) return false;
+      if (!matchRangeBucket(row.volumeRatio, filters.volumeRatioBucket, VOLUME_RATIO_BUCKETS)) return false;
+      if (!matchRangeBucket(row.operatingFee, filters.feeBucket, FEE_BUCKETS)) return false;
       return true;
     });
   }, [data, filters]);
@@ -588,18 +675,6 @@ export function MarketTerminal() {
               >
                 今日市场
               </button>
-              <button
-                type="button"
-                onClick={() => setView("settings")}
-                className={cn(
-                  "rounded border px-2 py-0.5 text-xs",
-                  view === "settings"
-                    ? "border-terminal-text text-terminal-text"
-                    : "border-transparent text-terminal-muted hover:text-terminal-text",
-                )}
-              >
-                设置
-              </button>
             </div>
             {view === "history" ? (
               <label className="flex items-center gap-1 text-xs text-terminal-muted">
@@ -623,11 +698,18 @@ export function MarketTerminal() {
             <Link href="/watchlist" className="text-terminal-muted hover:text-terminal-text">
               我的自选
             </Link>
-            {view === "settings" ? null : (
-              <button type="button" onClick={() => void load()} className="rounded border border-terminal-border px-2 py-0.5 text-xs text-terminal-muted hover:text-terminal-text">
-                刷新
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => setView("settings")}
+              className={cn(
+                "rounded border px-2 py-0.5 text-xs",
+                view === "settings"
+                  ? "border-terminal-text text-terminal-text"
+                  : "border-transparent text-terminal-muted hover:text-terminal-text",
+              )}
+            >
+              设置
+            </button>
           </nav>
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-terminal-border px-3 py-1 text-[11px] text-terminal-muted">
@@ -801,28 +883,18 @@ export function MarketTerminal() {
             className="max-w-[18rem]"
           />
           <Select label="类型" value={filters.category} onChange={(v) => updateFilter("category", v as Filters["category"])} options={["全部", ...ALL_CATEGORIES]} />
-          {filters.theme ? (
-            <button
-              type="button"
-              onClick={() => updateFilter("theme", "")}
-              className="h-8 border border-terminal-border px-2 text-xs hover:bg-white/5"
-            >
-              主题：{filters.theme} ×
-            </button>
-          ) : null}
+          <Select
+            label="热点主题"
+            value={filters.theme}
+            onChange={(v) => updateFilter("theme", v)}
+            options={themeOptions}
+            className="max-w-[16rem]"
+          />
           <Select
             label="涨跌幅"
             value={filters.changeBucket}
             onChange={(v) => updateFilter("changeBucket", v)}
-            options={[
-              ["", "全部"],
-              ["up5", "涨幅超过 5%"],
-              ["up2to5", "涨幅 2%～5%"],
-              ["up0to2", "涨幅 0%～2%"],
-              ["down0to2", "跌幅 0%～2%"],
-              ["down2to5", "跌幅 2%～5%"],
-              ["down5", "跌幅超过 5%"],
-            ]}
+            options={CHANGE_OPTIONS}
           />
           <Select
             label={view === "history" ? "收盘溢价" : "折溢价"}
@@ -837,13 +909,13 @@ export function MarketTerminal() {
               ["p5", "溢价超过 5%"],
             ]}
           />
-          <Range label="成交额(万)" a={filters.turnoverMin} b={filters.turnoverMax} onA={(v) => updateFilter("turnoverMin", v)} onB={(v) => updateFilter("turnoverMax", v)} />
-          <Range label="规模(亿)" a={filters.aumMin} b={filters.aumMax} onA={(v) => updateFilter("aumMin", v)} onB={(v) => updateFilter("aumMax", v)} />
-          <Range label="近5日涨幅%" a={filters.ret5Min} b={filters.ret5Max} onA={(v) => updateFilter("ret5Min", v)} onB={(v) => updateFilter("ret5Max", v)} />
-          <Range label="近20日涨幅%" a={filters.ret20Min} b={filters.ret20Max} onA={(v) => updateFilter("ret20Min", v)} onB={(v) => updateFilter("ret20Max", v)} />
-          <Range label="换手率%" a={filters.turnoverRateMin} b={filters.turnoverRateMax} onA={(v) => updateFilter("turnoverRateMin", v)} onB={(v) => updateFilter("turnoverRateMax", v)} />
-          <Range label="量比" a={filters.volumeRatioMin} b={filters.volumeRatioMax} onA={(v) => updateFilter("volumeRatioMin", v)} onB={(v) => updateFilter("volumeRatioMax", v)} />
-          <Range label="运作费率%" a={filters.feeMin} b={filters.feeMax} onA={(v) => updateFilter("feeMin", v)} onB={(v) => updateFilter("feeMax", v)} />
+          <Select label="成交额" value={filters.turnoverBucket} onChange={(v) => updateFilter("turnoverBucket", v)} options={bucketOptions(TURNOVER_BUCKETS)} />
+          <Select label="规模" value={filters.aumBucket} onChange={(v) => updateFilter("aumBucket", v)} options={bucketOptions(AUM_BUCKETS)} />
+          <Select label="近5日涨幅" value={filters.ret5Bucket} onChange={(v) => updateFilter("ret5Bucket", v)} options={CHANGE_OPTIONS} />
+          <Select label="近20日涨幅" value={filters.ret20Bucket} onChange={(v) => updateFilter("ret20Bucket", v)} options={RET20_OPTIONS} />
+          <Select label="换手率" value={filters.turnoverRateBucket} onChange={(v) => updateFilter("turnoverRateBucket", v)} options={bucketOptions(TURNOVER_RATE_BUCKETS)} />
+          <Select label="量比" value={filters.volumeRatioBucket} onChange={(v) => updateFilter("volumeRatioBucket", v)} options={bucketOptions(VOLUME_RATIO_BUCKETS)} />
+          <Select label="运作费率" value={filters.feeBucket} onChange={(v) => updateFilter("feeBucket", v)} options={bucketOptions(FEE_BUCKETS)} />
           <button
             type="button"
             onClick={() => {
@@ -1077,31 +1149,6 @@ function Select({
           );
         })}
       </select>
-    </label>
-  );
-}
-
-function Range({
-  label,
-  a,
-  b,
-  onA,
-  onB,
-}: {
-  label: string;
-  a: string;
-  b: string;
-  onA: (v: string) => void;
-  onB: (v: string) => void;
-}) {
-  return (
-    <label className="text-xs">
-      <span className="mb-1 block text-terminal-muted">{label}</span>
-      <span className="flex items-center gap-1">
-        <input value={a} onChange={(e) => onA(e.target.value)} className="h-8 w-16 border border-terminal-border bg-terminal-panel px-1 font-mono" />
-        <span className="text-terminal-muted">-</span>
-        <input value={b} onChange={(e) => onB(e.target.value)} className="h-8 w-16 border border-terminal-border bg-terminal-panel px-1 font-mono" />
-      </span>
     </label>
   );
 }

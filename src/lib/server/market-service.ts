@@ -44,6 +44,7 @@ let navMemory: NavStore = readJsonFile<NavStore>(NAV_FILE) ?? {};
 let f10Warming: Promise<void> | null = null;
 let iopvWarming: Promise<void> | null = null;
 let navWarming: Promise<void> | null = null;
+let universeInflight: Promise<{ total: number; quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number }> | null = null;
 
 
 function hasSessionTrade(q: import("../providers/types").QuoteRaw): boolean {
@@ -368,65 +369,27 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   };
 }
 
-export async function loadQuotes() {
-  const cached = memoryGet<{ total: number; quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number }>(
-    "universe",
-  );
-  if (cached) return cached;
-  const provider = getMarketProvider();
-  const data = await provider.fetchUniverse();
-  const wrapped = { ...data, fetchedAt: Date.now() };
-  memorySet("universe", wrapped, QUOTE_TTL_MS);
-  return wrapped;
+export async function loadQuotes(onProgress?: (done: number, total: number) => void) {
+  type UniverseCache = { total: number; quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number };
+  const cached = memoryGet<UniverseCache>("universe");
+  if (cached) {
+    onProgress?.(1, 1);
+    return cached;
+  }
+  if (!universeInflight) {
+    universeInflight = (async () => {
+      const data = await getMarketProvider().fetchUniverse(onProgress);
+      const wrapped = { ...data, fetchedAt: Date.now() };
+      memorySet("universe", wrapped, QUOTE_TTL_MS);
+      return wrapped;
+    })().finally(() => {
+      universeInflight = null;
+    });
+  }
+  return universeInflight;
 }
 
-export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): Promise<MarketPayload> {
-  onProgress?.({
-    stage: "universe",
-    label: "正在拉取沪深场内 ETF 行情列表…",
-    done: 0,
-    total: 1,
-    percent: 5,
-  });
-  const quotes = await loadQuotes();
-  onProgress?.({
-    stage: "universe",
-    label: `已获取 ${quotes.quotes.length} 只行情，正在检查基金资料…`,
-    done: 1,
-    total: 1,
-    percent: 15,
-  });
-  const codes = quotes.quotes.map((q) => q.code);
-  await ensureF10Ready(codes, (done, total) => {
-    onProgress?.({
-      stage: "f10",
-      label: "正在补齐基金资料（规模、运作费率、跟踪指数）…",
-      done,
-      total,
-      percent: stagePercent(15, 40, done, total),
-    });
-  });
-  await ensureNavReady(codes, (done, total) => {
-    onProgress?.({
-      stage: "nav",
-      label: "正在拉取最新公布的基金份额净值…",
-      done,
-      total,
-      percent: stagePercent(40, 94, done, total),
-    });
-  });
-  ensureWarmers(
-    codes,
-    quotes.quotes.map((q) => ({ code: q.code, secid: `${q.market}.${q.code}` })),
-  );
-  onProgress?.({
-    stage: "assemble",
-    label: "正在整理全市场行情…",
-    done: 1,
-    total: 1,
-    percent: 96,
-  });
-
+function buildLivePayload(quotes: { quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number }): MarketPayload {
   const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code], navMemory[q.code]));
   const f10Coverage = list.filter((x) => x.fundType).length;
   const iopvCoverage = list.filter((x) => x.iopv !== null).length;
@@ -455,7 +418,7 @@ export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): 
   if (f10Coverage < list.length) {
     notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}，缺失资料的品种暂归入「其他」，不会仅按名称强行分类。`);
   }
-  const payload: MarketPayload = {
+  return {
     source: getMarketProvider().label,
     fetchedAt: Math.floor(quotes.fetchedAt / 1000),
     quoteTime,
@@ -471,6 +434,68 @@ export async function getMarketPayload(onProgress?: (p: LoadProgress) => void): 
     view: "live",
     asOfDate: null,
   };
+}
+
+export async function getMarketPayload(
+  onProgress?: (p: LoadProgress) => void,
+  onPartial?: (payload: MarketPayload) => void,
+): Promise<MarketPayload> {
+  onProgress?.({
+    stage: "universe",
+    label: "正在拉取沪深场内 ETF 行情列表…",
+    done: 0,
+    total: 1,
+    percent: 5,
+  });
+  const quotes = await loadQuotes((done, total) => {
+    onProgress?.({
+      stage: "universe",
+      label: total > 1 ? `正在拉取沪深场内 ETF 行情列表（${done}/${total} 页）…` : "正在拉取沪深场内 ETF 行情列表…",
+      done,
+      total,
+      percent: 5 + Math.round((10 * done) / Math.max(total, 1)),
+    });
+  });
+  onProgress?.({
+    stage: "universe",
+    label: `已获取 ${quotes.quotes.length} 只行情，正在检查基金资料…`,
+    done: 1,
+    total: 1,
+    percent: 15,
+  });
+  onPartial?.(buildLivePayload(quotes));
+  const codes = quotes.quotes.map((q) => q.code);
+  await ensureF10Ready(codes, (done, total) => {
+    onProgress?.({
+      stage: "f10",
+      label: "正在补齐基金资料（规模、运作费率、跟踪指数）…",
+      done,
+      total,
+      percent: stagePercent(15, 40, done, total),
+    });
+  });
+  onPartial?.(buildLivePayload(quotes));
+  await ensureNavReady(codes, (done, total) => {
+    onProgress?.({
+      stage: "nav",
+      label: "正在拉取最新公布的基金份额净值…",
+      done,
+      total,
+      percent: stagePercent(40, 94, done, total),
+    });
+  });
+  ensureWarmers(
+    codes,
+    quotes.quotes.map((q) => ({ code: q.code, secid: `${q.market}.${q.code}` })),
+  );
+  onProgress?.({
+    stage: "assemble",
+    label: "正在整理全市场行情…",
+    done: 1,
+    total: 1,
+    percent: 96,
+  });
+  const payload = buildLivePayload(quotes);
   onProgress?.({
     stage: "assemble",
     label: "行情已就绪",

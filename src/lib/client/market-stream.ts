@@ -9,6 +9,7 @@ export async function fetchMarketStream(
   url: string,
   onProgress: (p: LoadProgress) => void,
   signal?: AbortSignal,
+  onResult?: (payload: MarketPayload) => void,
 ): Promise<MarketPayload> {
   const res = await fetch(url, {
     cache: "no-store",
@@ -40,7 +41,10 @@ export async function fetchMarketStream(
     if (dataLines.length === 0) return;
     const parsed = JSON.parse(dataLines.join("\n")) as MarketPayload & LoadProgress & { error?: string };
     if (event === "progress") onProgress(parsed);
-    else if (event === "result") result = parsed;
+    else if (event === "result") {
+      result = parsed;
+      onResult?.(parsed);
+    }
     else if (event === "error") streamError = parsed.error || "行情加载失败";
   };
 

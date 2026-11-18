@@ -56,7 +56,7 @@ export async function GET(req: Request) {
         const data =
           view === "prev" || view === "history"
             ? await getHistoryPayload(url.searchParams.get("date"), onProgress)
-            : await getMarketPayload(onProgress);
+            : await getMarketPayload(onProgress, (partial) => send("result", partial));
         send("result", data);
       } catch (err) {
         send("error", errorBody(err));

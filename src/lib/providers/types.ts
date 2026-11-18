@@ -37,7 +37,7 @@ export interface OfficialNav {
 export interface MarketDataProvider {
   id: string;
   label: string;
-  fetchUniverse(): Promise<{ total: number; quotes: QuoteRaw[] }>;
+  fetchUniverse(onProgress?: (done: number, total: number) => void): Promise<{ total: number; quotes: QuoteRaw[] }>;
   fetchIopv(secid: string): Promise<IopvSnapshot>;
   fetchFundProfile(code: string): Promise<FundProfile | null>;
   fetchFundProfiles(codes: string[]): Promise<FundProfile[]>;

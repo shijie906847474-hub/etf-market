@@ -97,16 +97,23 @@ async function fetchJson(url: string, timeoutMs = 20000, extraHeaders?: Record<s
   }
 }
 
-async function fetchWithHosts(pathAndQuery: string, hosts: string[]): Promise<any> {
+const lastGoodHost = new Map<string, string>();
+
+function orderedHosts(hosts: string[]): string[] {
+  const preferred = lastGoodHost.get(hosts.join("|"));
+  if (!preferred || !hosts.includes(preferred)) return hosts;
+  return [preferred, ...hosts.filter((h) => h !== preferred)];
+}
+
+async function fetchWithHosts(pathAndQuery: string, hosts: string[], timeoutMs = 20000): Promise<any> {
   let lastErr: unknown;
-  for (const host of hosts) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        return await fetchJson(`${host}${pathAndQuery}`);
-      } catch (err) {
-        lastErr = err;
-        await sleep(180 * (attempt + 1));
-      }
+  for (const host of orderedHosts(hosts)) {
+    try {
+      const data = await fetchJson(`${host}${pathAndQuery}`, timeoutMs);
+      lastGoodHost.set(hosts.join("|"), host);
+      return data;
+    } catch (err) {
+      lastErr = err;
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -185,13 +192,14 @@ export class EastMoneyProvider implements MarketDataProvider {
   id = "eastmoney";
   label = "东方财富公开行情";
 
-  async fetchUniverse(): Promise<{ total: number; quotes: QuoteRaw[] }> {
+  async fetchUniverse(onProgress?: (done: number, total: number) => void): Promise<{ total: number; quotes: QuoteRaw[] }> {
     const pageSize = 100;
     const first = await fetchWithHosts(
       `/api/qt/clist/get?pn=1&pz=${pageSize}&po=1&np=1&ut=${UT}&fltt=2&invt=2&fid=f6&fs=${encodeURIComponent(
         ETF_FS,
       )}&fields=${LIST_FIELDS}`,
       PUSH_HOSTS,
+      8000,
     );
     const total = Number(first?.data?.total ?? 0);
     const pages = Math.max(1, Math.ceil(total / pageSize));
@@ -206,14 +214,17 @@ export class EastMoneyProvider implements MarketDataProvider {
       }
     };
     consume(first);
+    onProgress?.(1, pages);
     for (let pn = 2; pn <= pages; pn++) {
       const payload = await fetchWithHosts(
         `/api/qt/clist/get?pn=${pn}&pz=${pageSize}&po=1&np=1&ut=${UT}&fltt=2&invt=2&fid=f6&fs=${encodeURIComponent(
           ETF_FS,
         )}&fields=${LIST_FIELDS}`,
         PUSH_HOSTS,
+        8000,
       );
       consume(payload);
+      onProgress?.(pn, pages);
       await sleep(40);
     }
     const uniq = new Map<string, QuoteRaw>();
