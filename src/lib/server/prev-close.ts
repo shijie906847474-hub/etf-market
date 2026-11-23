@@ -322,6 +322,7 @@ export function listHistoryCache(): HistoryCacheItem[] {
       etfCount: payload.list.length,
       savedAt: payload.fetchedAt ?? Math.floor(file.mtimeMs / 1000),
       sizeBytes: file.size,
+      kind: "close",
     });
   }
   return [...items.values()].sort((a, b) => b.date.localeCompare(a.date));

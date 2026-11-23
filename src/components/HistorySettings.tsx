@@ -14,20 +14,43 @@ function formatSize(bytes: number): string {
 }
 
 
+function cacheItemKey(item: HistoryCacheItem): string {
+  return `${item.kind ?? "close"}:${item.date}`;
+}
+
+function snapshotKindLabel(item: HistoryCacheItem): string {
+  if (item.kind === "live") {
+    if (item.freshness === "交易时段（公开行情，可能延迟）") return "当日行情快照（盘中，非收盘磁带）";
+    if (item.freshness === "已收盘（日终行情）") return "当日行情快照（收盘后公开行情，非官方收盘磁带）";
+    return "当日行情快照（非交易时段行情，非收盘磁带）";
+  }
+  return "历史收盘快照";
+}
+
 function mergeCacheItems(groups: HistoryCacheItem[][]): HistoryCacheItem[] {
   const items = new Map<string, HistoryCacheItem>();
   for (const group of groups) {
     for (const item of group) {
-      const prev = items.get(item.date);
-      items.set(item.date, {
-        date: item.date,
-        etfCount: Math.max(prev?.etfCount ?? 0, item.etfCount),
-        savedAt: Math.max(prev?.savedAt ?? 0, item.savedAt),
-        sizeBytes: Math.max(prev?.sizeBytes ?? 0, item.sizeBytes),
+      const kind = item.kind ?? "close";
+      const normalized: HistoryCacheItem = { ...item, kind };
+      const key = cacheItemKey(normalized);
+      const prev = items.get(key);
+      items.set(key, {
+        date: normalized.date,
+        etfCount: Math.max(prev?.etfCount ?? 0, normalized.etfCount),
+        savedAt: Math.max(prev?.savedAt ?? 0, normalized.savedAt),
+        sizeBytes: Math.max(prev?.sizeBytes ?? 0, normalized.sizeBytes),
+        kind,
+        freshness: (prev && prev.savedAt >= normalized.savedAt ? prev.freshness : normalized.freshness) ?? null,
       });
     }
   }
-  return [...items.values()].sort((a, b) => b.date.localeCompare(a.date));
+  return [...items.values()].sort((a, b) => {
+    const byDate = b.date.localeCompare(a.date);
+    if (byDate !== 0) return byDate;
+    if (a.kind === b.kind) return 0;
+    return a.kind === "live" ? -1 : 1;
+  });
 }
 
 export function HistorySettings() {
@@ -170,7 +193,7 @@ export function HistorySettings() {
 
       <h2 className="mt-8 text-sm font-medium">历史行情缓存</h2>
       <p className="mt-1 max-w-3xl text-xs leading-relaxed text-terminal-muted">
-        在「历史市场」里选过的交易日，收盘行情会保存在本机浏览器中，同一天再次打开会直接读取，不用重新拉日 K。下面列出已缓存的日期，可勾选删除，或一次性全部清除。服务端文件缓存只在有持久磁盘的环境生效；当前线上部署没有持久磁盘，因此以本机缓存为准。
+        「今日市场」成功加载后，会把当天的行情快照写入本机浏览器缓存，便于在此核对当天是否已保存。这是当日公开行情（盘中或收盘后），不是「历史市场」那种按日 K 与同日官方净值重建的收盘磁带，也不会用最新价、昨收或 typelist 净值去补收盘溢价。在「历史市场」里选过的已结束交易日，收盘快照同样会保存在本机，同一天再次打开会直接读取，不用重新拉日 K。下面列出已缓存的日期，可勾选删除，或一次性全部清除。服务端文件缓存只在有持久磁盘的环境生效；当前线上部署没有持久磁盘，因此以本机缓存为准。
       </p>
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <button
@@ -202,16 +225,17 @@ export function HistorySettings() {
       {loading ? (
         <div className="mt-6 text-sm text-terminal-muted">正在读取缓存…</div>
       ) : items.length === 0 ? (
-        <div className="mt-6 text-sm text-terminal-muted">暂无已缓存的历史行情。到「历史市场」选择一个交易日后，这里会出现对应日期。</div>
+        <div className="mt-6 text-sm text-terminal-muted">暂无已缓存的行情。打开「今日市场」并成功加载后，当天的行情快照会出现在这里；到「历史市场」选择一个已结束的交易日后，也会出现对应日期的收盘快照。</div>
       ) : (
         <div className="mt-4 overflow-x-auto">
-          <table className="min-w-[640px] text-sm">
+          <table className="min-w-[780px] text-sm">
             <thead>
               <tr className="text-left text-terminal-muted">
                 <th className="w-8 border-b border-terminal-border px-2 py-1 font-medium">
                   <input type="checkbox" checked={selected.size === items.length && items.length > 0} onChange={toggleAll} />
                 </th>
-                <th className="border-b border-terminal-border px-2 py-1 font-medium">收盘日期</th>
+                <th className="border-b border-terminal-border px-2 py-1 font-medium">日期</th>
+                <th className="border-b border-terminal-border px-2 py-1 font-medium">快照类型</th>
                 <th className="border-b border-terminal-border px-2 py-1 font-medium text-right">品种数</th>
                 <th className="border-b border-terminal-border px-2 py-1 font-medium text-right">占用空间</th>
                 <th className="border-b border-terminal-border px-2 py-1 font-medium">写入时间</th>
@@ -220,11 +244,12 @@ export function HistorySettings() {
             </thead>
             <tbody>
               {items.map((item) => (
-                <tr key={item.date} className="odd:bg-white/[0.015]">
+                <tr key={`${item.kind}:${item.date}`} className="odd:bg-white/[0.015]">
                   <td className="px-2 py-1">
                     <input type="checkbox" checked={selected.has(item.date)} onChange={() => toggle(item.date)} />
                   </td>
                   <td className="px-2 py-1 font-mono">{item.date}</td>
+                  <td className="px-2 py-1 text-terminal-muted">{snapshotKindLabel(item)}</td>
                   <td className="px-2 py-1 text-right font-mono">{item.etfCount}</td>
                   <td className="px-2 py-1 text-right font-mono">{formatSize(item.sizeBytes)}</td>
                   <td className="px-2 py-1 font-mono text-terminal-muted">{formatShanghai(item.savedAt)}</td>

@@ -5,7 +5,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { COLUMNS, DEFAULT_VISIBLE, columnLabel, type ColumnDef, type ColumnKey } from "@/components/columns";
 import { fetchMarketStream, isAbortError } from "@/lib/client/market-stream";
 import { HistorySettings } from "@/components/HistorySettings";
-import { isHistoryCacheValid, readHistoryCache, writeHistoryCache } from "@/lib/client/prev-close-cache";
+import { isHistoryCacheValid, readHistoryCache, writeHistoryCache, writeLiveSnapshotCache } from "@/lib/client/prev-close-cache";
 import { readLiveMarketCache, writeLiveMarketCache } from "@/lib/client/live-market-cache";
 import { useRefreshInterval, useRefreshMode } from "@/lib/client/refresh-interval";
 import type { LoadProgress } from "@/lib/load-progress";
@@ -18,8 +18,8 @@ import { isWatched, loadWatchlist, saveWatchlist, toggleWatch, type WatchGroup }
 import { cn } from "@/lib/cn";
 
 type MarketView = "today" | "history" | "settings";
-const COLUMN_STORE_KEY = "etf-market-columns-v3";
-const COLUMN_STORE_LEGACY = ["etf-market-columns-v2", "etf-market-columns-v1"];
+const COLUMN_STORE_KEY = "etf-market-columns-v4";
+const COLUMN_STORE_LEGACY = ["etf-market-columns-v3", "etf-market-columns-v2", "etf-market-columns-v1"];
 
 const COLUMN_KEYS = new Set<string>(COLUMNS.map((c) => c.key));
 
@@ -422,7 +422,7 @@ export function MarketTerminal() {
   const headerRef = useRef<HTMLElement>(null);
   const [headerOffset, setHeaderOffset] = useState(0);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
-  const [sortKey, setSortKey] = useState<ColumnKey>("turnover");
+  const [sortKey, setSortKey] = useState<ColumnKey>("changePct");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
@@ -476,6 +476,7 @@ export function MarketTerminal() {
     hasLiveRef.current = true;
     setLiveData(payload);
     writeLiveMarketCache(payload);
+    void writeLiveSnapshotCache(payload);
     setLoading(false);
   }, []);
 
@@ -969,7 +970,7 @@ export function MarketTerminal() {
 
           <section className="overflow-x-auto border-b border-terminal-border">
             <div className="flex min-w-[980px]">
-              {(data?.categories ?? []).map((c) => (
+              {(data?.categories ?? []).filter((c) => c.category !== "其他").map((c) => (
                 <button
                   key={c.category}
                   type="button"
@@ -993,7 +994,7 @@ export function MarketTerminal() {
                 </button>
               ))}
             </div>
-            <div className="px-3 py-1 text-[10px] text-terminal-muted">分类涨跌幅为成交额加权；分类依据 F10 基金类型与跟踪指数，缺失资料暂归「其他」。</div>
+            <div className="px-3 py-1 text-[10px] text-terminal-muted">分类涨跌幅为成交额加权；分类依据 F10 基金类型与跟踪指数。不再单列「其他」；极少数无法归类的品种只出现在全市场列表中。</div>
           </section>
 
           <section className="grid grid-cols-1 gap-0 border-b border-terminal-border lg:grid-cols-4">
@@ -1146,7 +1147,7 @@ export function MarketTerminal() {
       <section className="px-0">
         <div className="flex items-center justify-between px-3 py-1 text-[11px] text-terminal-muted">
           <span>
-            当前筛选 {sorted.length} 只 / 全市场 {data?.list.length ?? 0} 只 · 默认按成交额降序 · 成交量单位为手（1 手 = 100 份）
+            当前筛选 {sorted.length} 只 / 全市场 {data?.list.length ?? 0} 只 · 默认按涨跌幅降序 · 成交量单位为手（1 手 = 100 份）
           </span>
           <label>
             每页
@@ -1207,7 +1208,7 @@ export function MarketTerminal() {
                       {isWatched(groups, row.code) ? "★" : "☆"}
                     </button>
                   </td>
-                  {COLUMNS.filter((c) => visible.includes(c.key)).map((c) => {
+                  {visibleDefs.map((c) => {
                     const colored = ["change", "changePct", "premiumPct", "ret5d", "ret20d", "ret60d", "ret1y", "ytdChangePct"].includes(c.key);
                     const statusMuted =
                       (c.key === "last" || c.key === "status") &&

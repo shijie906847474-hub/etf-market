@@ -7,6 +7,8 @@ import type { EtfRow, MarketPayload } from "@/lib/types";
 import { loadWatchlist, saveWatchlist, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
 import { readLiveMarketCache, writeLiveMarketCache } from "@/lib/client/live-market-cache";
+import { writeLiveSnapshotCache } from "@/lib/client/prev-close-cache";
+
 import { useRefreshInterval, useRefreshMode } from "@/lib/client/refresh-interval";
 
 export function WatchlistView() {
@@ -57,6 +59,7 @@ export function WatchlistView() {
       if (!res.ok) throw new Error(json.error || "行情加载失败");
       setData(json);
       writeLiveMarketCache(json);
+      void writeLiveSnapshotCache(json);
       setError(null);
     } catch (err) {
       if (!silent) setError(err instanceof Error ? err.message : "行情加载失败");

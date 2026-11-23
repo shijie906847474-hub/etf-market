@@ -190,14 +190,17 @@ export const ALL_CATEGORIES: EtfCategory[] = [
   "商品",
   "债券",
   "货币",
-  "其他",
 ];
 
 export type SortKey = keyof EtfRow;
+
+export type HistoryCacheKind = "close" | "live";
 
 export interface HistoryCacheItem {
   date: string;
   etfCount: number;
   savedAt: number;
   sizeBytes: number;
+  kind: HistoryCacheKind;
+  freshness?: DataFreshness | null;
 }

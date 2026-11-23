@@ -518,7 +518,7 @@ function buildLivePayload(quotes: {
     notes.push(`IOPV 缓存覆盖 ${iopvCoverage}/${list.length}，仅用于 IOPV 列与详情展示，不参与折溢价。`);
   }
   if (f10Coverage < list.length) {
-    notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}，缺失资料的品种暂归入「其他」，不会仅按名称强行分类。`);
+    notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}；极少数无法归入宽基/行业/主题/跨境/商品/债券/货币的品种不再单列「其他」，只出现在全市场列表中，不会仅按名称强行分类。`);
   }
   return {
     source: describeLiveSource(quotes.quoteSource, quotes.universeSource),
