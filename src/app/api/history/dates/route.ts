@@ -3,6 +3,7 @@ import { listCompletedTradeDates } from "@/lib/server/prev-close";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const preferredRegion = "hkg1";
 
 export async function GET() {
   try {

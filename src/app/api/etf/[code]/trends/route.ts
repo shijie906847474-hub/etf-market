@@ -3,6 +3,7 @@ import { computeIntradayVwap } from "@/lib/indicators";
 import { getTrends } from "@/lib/server/market-service";
 
 export const dynamic = "force-dynamic";
+export const preferredRegion = "hkg1";
 
 export async function GET(
   request: Request,

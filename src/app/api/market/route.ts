@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import type { LoadProgress } from "@/lib/load-progress";
+import { publicUpstreamMessage } from "@/lib/providers/errors";
 import { getMarketPayload } from "@/lib/server/market-service";
 import { getHistoryPayload } from "@/lib/server/prev-close";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 export const maxDuration = 300;
+export const preferredRegion = "hkg1";
 
 const PAD = `: ${" ".repeat(2048)}\n\n`;
 
@@ -14,9 +16,8 @@ function ssePacket(event: string, data: unknown): string {
 }
 
 function errorBody(err: unknown) {
-  const message = err instanceof Error ? err.message : "行情接口异常";
   return {
-    error: message,
+    error: publicUpstreamMessage(err),
     source: "东方财富公开行情",
     freshness: "接口异常",
   };

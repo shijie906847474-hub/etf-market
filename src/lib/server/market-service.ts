@@ -4,6 +4,9 @@ import { buildThemeHotspots } from "../themes";
 import { alignOfficialNav, isMoneyMarketFund, listedDateFromF26, operatingFeeOf, premiumFromNav, VOLUME_RATIO_SURGE } from "../format";
 import { marketFreshness, shanghaiDateString } from "../market-hours";
 import { getMarketProvider } from "../providers";
+import { BOTH_QUOTE_SOURCES_UNAVAILABLE, publicUpstreamMessage, UpstreamUnavailableError } from "../providers/errors";
+import { fetchTencentQuotes, type QuoteSource, type UniverseItem } from "../providers/tencent";
+import type { OfficialNav, QuoteRaw } from "../providers/types";
 import type {
   CategoryStat,
   EtfCategory,
@@ -14,7 +17,6 @@ import type {
   MarketPayload,
 } from "../types";
 import { ALL_CATEGORIES } from "../types";
-import type { OfficialNav } from "../providers/types";
 import type { LoadProgress } from "../load-progress";
 import { stagePercent } from "../load-progress";
 
@@ -44,7 +46,15 @@ let navMemory: NavStore = readJsonFile<NavStore>(NAV_FILE) ?? {};
 let f10Warming: Promise<void> | null = null;
 let iopvWarming: Promise<void> | null = null;
 let navWarming: Promise<void> | null = null;
-let universeInflight: Promise<{ total: number; quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number }> | null = null;
+type UniverseCache = {
+  total: number;
+  quotes: QuoteRaw[];
+  fetchedAt: number;
+  quoteSource: QuoteSource;
+};
+
+let lastSuccessfulUniverse: { total: number; items: UniverseItem[] } | null = null;
+let universeInflight: Promise<UniverseCache> | null = null;
 
 
 function hasSessionTrade(q: import("../providers/types").QuoteRaw): boolean {
@@ -378,8 +388,14 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   };
 }
 
+function rememberUniverse(quotes: QuoteRaw[], total: number) {
+  lastSuccessfulUniverse = {
+    total,
+    items: quotes.map((q) => ({ code: q.code, market: q.market, name: q.name })),
+  };
+}
+
 export async function loadQuotes(onProgress?: (done: number, total: number) => void) {
-  type UniverseCache = { total: number; quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number };
   const cached = memoryGet<UniverseCache>("universe");
   if (cached) {
     onProgress?.(1, 1);
@@ -387,10 +403,33 @@ export async function loadQuotes(onProgress?: (done: number, total: number) => v
   }
   if (!universeInflight) {
     universeInflight = (async () => {
-      const data = await getMarketProvider().fetchUniverse(onProgress);
-      const wrapped = { ...data, fetchedAt: Date.now() };
-      memorySet("universe", wrapped, QUOTE_TTL_MS);
-      return wrapped;
+      try {
+        const data = await getMarketProvider().fetchUniverse(onProgress);
+        rememberUniverse(data.quotes, data.total);
+        const wrapped: UniverseCache = { ...data, fetchedAt: Date.now(), quoteSource: "eastmoney" };
+        memorySet("universe", wrapped, QUOTE_TTL_MS);
+        return wrapped;
+      } catch (err) {
+        console.error("[market] East Money universe failed", publicUpstreamMessage(err), err);
+        if (!lastSuccessfulUniverse || lastSuccessfulUniverse.items.length === 0) {
+          throw err instanceof Error ? err : new UpstreamUnavailableError(publicUpstreamMessage(err));
+        }
+        try {
+          onProgress?.(0, 1);
+          const quotes = await fetchTencentQuotes(lastSuccessfulUniverse.items);
+          const wrapped: UniverseCache = {
+            total: lastSuccessfulUniverse.total,
+            quotes,
+            fetchedAt: Date.now(),
+            quoteSource: "tencent",
+          };
+          memorySet("universe", wrapped, QUOTE_TTL_MS);
+          return wrapped;
+        } catch (tencentErr) {
+          console.error("[market] Tencent quote fallback failed", tencentErr);
+          throw new UpstreamUnavailableError(BOTH_QUOTE_SOURCES_UNAVAILABLE, { cause: tencentErr });
+        }
+      }
     })().finally(() => {
       universeInflight = null;
     });
@@ -398,7 +437,7 @@ export async function loadQuotes(onProgress?: (done: number, total: number) => v
   return universeInflight;
 }
 
-function buildLivePayload(quotes: { quotes: import("../providers/types").QuoteRaw[]; fetchedAt: number }): MarketPayload {
+function buildLivePayload(quotes: { quotes: QuoteRaw[]; fetchedAt: number; quoteSource?: QuoteSource }): MarketPayload {
   const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code], navMemory[q.code]));
   const f10Coverage = list.filter((x) => x.fundType).length;
   const iopvCoverage = list.filter((x) => x.iopv !== null).length;
@@ -406,7 +445,16 @@ function buildLivePayload(quotes: { quotes: import("../providers/types").QuoteRa
   const quoteTimes = list.map((x) => x.quoteTime).filter((x): x is number => x !== null);
   const quoteTime = quoteTimes.length ? Math.max(...quoteTimes) : null;
   const { freshness, delayed } = marketFreshness();
-  const notes = [
+  const tencentFallback = quotes.quoteSource === "tencent";
+  const notes = tencentFallback
+    ? [
+        "实时报价来自腾讯财经公开接口，因东方财富行情列表暂时不可用而启用兜底；不是交易所官方实时馈送。",
+        "折溢价仍只使用东方财富官方公布净值（lsjz 的 DWJZ）；缺少官方净值时折溢价显示为缺失，不会用腾讯最新价或昨收代替。",
+        "年初至今涨跌幅、近 5/20/60 日与近一年涨跌幅、停牌标记、上市日期等依赖东方财富列表的字段，兜底行情中可能为空。量比在腾讯报价中有值时会使用（已与东方财富抽样核对）。",
+        "基金规模、运作费率、跟踪指数来自上次成功的东方财富 F10 缓存；尚未缓存的显示为缺失。",
+        "IOPV 仍来自东方财富 stock/get 的 f71（若缓存中有），仅作盘中参考，不参与折溢价。",
+      ]
+    : [
     "数据来源为东方财富公开行情，不是交易所官方实时馈送。",
     "基金规模取自 F10 NEW_SCALE，并标注披露日；不是现价×份额。",
     "折溢价 = (最新价 − 最新公布的基金份额净值) / 净值 × 100，与常见券商软件口径一致。净值取自东方财富基金历史净值接口 lsjz 的最新一条 DWJZ，并标注净值日期；不会用 IOPV、stock/get 的 f131、昨收或估值填补。收益结转型货币基金的 lsjz DWJZ 实际是每万份收益，不能直接与市价相比；这类基金官方单位净值恒为 1.00 元，折溢价按与市价相同的报价单位对齐（二级市场通常为每百份 100 元）。净值型货币（如银华日利）仍直接使用公布的单位净值。",
@@ -428,7 +476,9 @@ function buildLivePayload(quotes: { quotes: import("../providers/types").QuoteRa
     notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}，缺失资料的品种暂归入「其他」，不会仅按名称强行分类。`);
   }
   return {
-    source: getMarketProvider().label,
+    source: tencentFallback
+      ? "腾讯行情（实时报价）；基金资料与净值仍来自东方财富缓存"
+      : getMarketProvider().label,
     fetchedAt: Math.floor(quotes.fetchedAt / 1000),
     quoteTime,
     freshness,
@@ -640,7 +690,10 @@ export async function getEtfDetail(code: string, marketHint?: number): Promise<E
   const row = mergeRow(quote, profile ?? f10Memory[code], iopv, navMemory[code]);
   const { freshness, delayed } = marketFreshness();
   return {
-    source: provider.label,
+    source:
+      universe.quoteSource === "tencent"
+        ? "腾讯行情（实时报价）；基金资料与净值仍来自东方财富"
+        : provider.label,
     fetchedAt: Math.floor(Date.now() / 1000),
     freshness,
     delayed,

@@ -1,6 +1,7 @@
 import { extractTrackingErrorTarget } from "../classify";
 import { parseFeePercent, toNum } from "../format";
 import type { FundProfile, IopvSnapshot, KlineBar, TrendPoint } from "../types";
+import { EASTMONEY_GATEWAY_UNAVAILABLE, isAbortLike, isTransientUpstreamError, UpstreamUnavailableError } from "./errors";
 import type { MarketDataProvider, OfficialNav, QuoteRaw } from "./types";
 
 const PUSH_HOSTS = [
@@ -76,6 +77,25 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
+function throwFriendlyUpstream(url: string, err: unknown, status?: number): never {
+  const host = hostOf(url);
+  const statusPart = status != null ? `HTTP ${status}` : isAbortLike(err) ? "timeout/aborted" : "error";
+  console.error(`[eastmoney] ${statusPart} ${host ?? url}`);
+  throw new UpstreamUnavailableError(EASTMONEY_GATEWAY_UNAVAILABLE, {
+    status: status ?? null,
+    sourceHost: host,
+    cause: err,
+  });
+}
+
 async function fetchJson(url: string, timeoutMs = 20000, extraHeaders?: Record<string, string>): Promise<unknown> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -90,8 +110,16 @@ async function fetchJson(url: string, timeoutMs = 20000, extraHeaders?: Record<s
         ...extraHeaders,
       },
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+    if (!res.ok) {
+      if (res.status === 502 || res.status === 503) throwFriendlyUpstream(url, new Error(`HTTP ${res.status}`), res.status);
+      console.error(`[eastmoney] HTTP ${res.status} ${hostOf(url) ?? url}`);
+      throw new Error(`HTTP ${res.status}`);
+    }
     return await res.json();
+  } catch (err) {
+    if (err instanceof UpstreamUnavailableError) throw err;
+    if (isAbortLike(err)) throwFriendlyUpstream(url, err);
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -107,13 +135,18 @@ function orderedHosts(hosts: string[]): string[] {
 
 async function fetchWithHosts(pathAndQuery: string, hosts: string[], timeoutMs = 20000): Promise<any> {
   let lastErr: unknown;
+  const key = hosts.join("|");
   for (const host of orderedHosts(hosts)) {
     try {
       const data = await fetchJson(`${host}${pathAndQuery}`, timeoutMs);
-      lastGoodHost.set(hosts.join("|"), host);
+      lastGoodHost.set(key, host);
       return data;
     } catch (err) {
       lastErr = err;
+      // 上次好用的节点若开始 502/超时，立刻降级，下一页优先试其他节点。
+      if (lastGoodHost.get(key) === host && isTransientUpstreamError(err)) {
+        lastGoodHost.delete(key);
+      }
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));

@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getEtfDetail } from "@/lib/server/market-service";
 
 export const dynamic = "force-dynamic";
+export const preferredRegion = "hkg1";
 
 export async function GET(
   request: Request,
