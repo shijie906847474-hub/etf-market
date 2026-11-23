@@ -4,8 +4,10 @@ import { buildThemeHotspots } from "../themes";
 import { alignOfficialNav, isMoneyMarketFund, listedDateFromF26, operatingFeeOf, premiumFromNav, VOLUME_RATIO_SURGE } from "../format";
 import { marketFreshness, shanghaiDateString } from "../market-hours";
 import { getMarketProvider } from "../providers";
-import { BOTH_QUOTE_SOURCES_UNAVAILABLE, publicUpstreamMessage, UpstreamUnavailableError } from "../providers/errors";
-import { fetchTencentQuotes, type QuoteSource, type UniverseItem } from "../providers/tencent";
+import { fetchEtfTypeList } from "../providers/eastmoney";
+import { UNIVERSE_AND_QUOTES_UNAVAILABLE, publicUpstreamMessage, UpstreamUnavailableError } from "../providers/errors";
+import { fetchSinaEtfUniverse } from "../providers/sina";
+import { fetchTencentQuotes, type QuoteSource, type UniverseItem, type UniverseSource } from "../providers/tencent";
 import type { OfficialNav, QuoteRaw } from "../providers/types";
 import type {
   CategoryStat,
@@ -51,6 +53,7 @@ type UniverseCache = {
   quotes: QuoteRaw[];
   fetchedAt: number;
   quoteSource: QuoteSource;
+  universeSource: UniverseSource;
 };
 
 let lastSuccessfulUniverse: { total: number; items: UniverseItem[] } | null = null;
@@ -395,6 +398,44 @@ function rememberUniverse(quotes: QuoteRaw[], total: number) {
   };
 }
 
+
+function describeLiveSource(quoteSource?: QuoteSource, universeSource?: UniverseSource): string {
+  if (quoteSource !== "tencent") return getMarketProvider().label;
+  if (universeSource === "sina") {
+    return "腾讯行情（实时报价）；名单来自新浪基金 ETF 节点（可能少于全市场）；基金资料与净值仍来自东方财富";
+  }
+  if (universeSource === "memory") {
+    return "腾讯行情（实时报价）；名单来自上次成功的列表缓存；基金资料与净值仍来自东方财富";
+  }
+  return "腾讯行情（实时报价）；名单来自东方财富 ETF 列表；基金资料与净值仍来自东方财富";
+}
+
+async function resolveFallbackUniverse(
+  onProgress?: (done: number, total: number) => void,
+): Promise<{ total: number; items: UniverseItem[]; universeSource: UniverseSource } | null> {
+  try {
+    const typelist = await fetchEtfTypeList(onProgress);
+    if (typelist.items.length > 0) {
+      return { ...typelist, universeSource: "eastmoney-typelist" };
+    }
+  } catch (err) {
+    console.error("[market] typelist universe failed", err);
+  }
+  if (lastSuccessfulUniverse && lastSuccessfulUniverse.items.length > 0) {
+    onProgress?.(1, 1);
+    return { ...lastSuccessfulUniverse, universeSource: "memory" };
+  }
+  try {
+    const sina = await fetchSinaEtfUniverse(onProgress);
+    if (sina.items.length > 0) {
+      return { ...sina, universeSource: "sina" };
+    }
+  } catch (err) {
+    console.error("[market] sina universe failed", err);
+  }
+  return null;
+}
+
 export async function loadQuotes(onProgress?: (done: number, total: number) => void) {
   const cached = memoryGet<UniverseCache>("universe");
   if (cached) {
@@ -406,28 +447,35 @@ export async function loadQuotes(onProgress?: (done: number, total: number) => v
       try {
         const data = await getMarketProvider().fetchUniverse(onProgress);
         rememberUniverse(data.quotes, data.total);
-        const wrapped: UniverseCache = { ...data, fetchedAt: Date.now(), quoteSource: "eastmoney" };
+        const wrapped: UniverseCache = {
+          ...data,
+          fetchedAt: Date.now(),
+          quoteSource: "eastmoney",
+          universeSource: "eastmoney-clist",
+        };
         memorySet("universe", wrapped, QUOTE_TTL_MS);
         return wrapped;
       } catch (err) {
-        console.error("[market] East Money universe failed", publicUpstreamMessage(err), err);
-        if (!lastSuccessfulUniverse || lastSuccessfulUniverse.items.length === 0) {
-          throw err instanceof Error ? err : new UpstreamUnavailableError(publicUpstreamMessage(err));
+        console.error("[market] East Money push2/clist failed", publicUpstreamMessage(err), err);
+        const fallback = await resolveFallbackUniverse(onProgress);
+        if (!fallback) {
+          throw new UpstreamUnavailableError(UNIVERSE_AND_QUOTES_UNAVAILABLE, { cause: err });
         }
         try {
-          onProgress?.(0, 1);
-          const quotes = await fetchTencentQuotes(lastSuccessfulUniverse.items);
+          const quotes = await fetchTencentQuotes(fallback.items);
+          rememberUniverse(quotes, fallback.total);
           const wrapped: UniverseCache = {
-            total: lastSuccessfulUniverse.total,
+            total: fallback.total,
             quotes,
             fetchedAt: Date.now(),
             quoteSource: "tencent",
+            universeSource: fallback.universeSource,
           };
           memorySet("universe", wrapped, QUOTE_TTL_MS);
           return wrapped;
         } catch (tencentErr) {
           console.error("[market] Tencent quote fallback failed", tencentErr);
-          throw new UpstreamUnavailableError(BOTH_QUOTE_SOURCES_UNAVAILABLE, { cause: tencentErr });
+          throw new UpstreamUnavailableError(UNIVERSE_AND_QUOTES_UNAVAILABLE, { cause: tencentErr });
         }
       }
     })().finally(() => {
@@ -437,7 +485,12 @@ export async function loadQuotes(onProgress?: (done: number, total: number) => v
   return universeInflight;
 }
 
-function buildLivePayload(quotes: { quotes: QuoteRaw[]; fetchedAt: number; quoteSource?: QuoteSource }): MarketPayload {
+function buildLivePayload(quotes: {
+  quotes: QuoteRaw[];
+  fetchedAt: number;
+  quoteSource?: QuoteSource;
+  universeSource?: UniverseSource;
+}): MarketPayload {
   const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code], navMemory[q.code]));
   const f10Coverage = list.filter((x) => x.fundType).length;
   const iopvCoverage = list.filter((x) => x.iopv !== null).length;
@@ -446,12 +499,19 @@ function buildLivePayload(quotes: { quotes: QuoteRaw[]; fetchedAt: number; quote
   const quoteTime = quoteTimes.length ? Math.max(...quoteTimes) : null;
   const { freshness, delayed } = marketFreshness();
   const tencentFallback = quotes.quoteSource === "tencent";
+  const universeNote =
+    quotes.universeSource === "sina"
+      ? "ETF 名单来自新浪基金节点 etf_hq_fund，覆盖可能少于东方财富全市场列表。"
+      : quotes.universeSource === "memory"
+        ? "ETF 名单来自进程内存中上次成功拉取的列表缓存。"
+        : "ETF 名单来自东方财富 datacenter-web RPT_FUND_ETFLIST（代码、名称、市场），不是 push2 实时列表。";
   const notes = tencentFallback
     ? [
-        "实时报价来自腾讯财经公开接口，因东方财富行情列表暂时不可用而启用兜底；不是交易所官方实时馈送。",
-        "折溢价仍只使用东方财富官方公布净值（lsjz 的 DWJZ）；缺少官方净值时折溢价显示为缺失，不会用腾讯最新价或昨收代替。",
-        "年初至今涨跌幅、近 5/20/60 日与近一年涨跌幅、停牌标记、上市日期等依赖东方财富列表的字段，兜底行情中可能为空。量比在腾讯报价中有值时会使用（已与东方财富抽样核对）。",
-        "基金规模、运作费率、跟踪指数来自上次成功的东方财富 F10 缓存；尚未缓存的显示为缺失。",
+        "实时报价来自腾讯财经公开接口，因东方财富 push2 行情列表暂时不可用而启用兜底；不是交易所官方实时馈送。",
+        universeNote,
+        "折溢价仍只使用东方财富官方公布净值（lsjz 的 DWJZ）；缺少官方净值时折溢价显示为缺失，不会用腾讯最新价、昨收或 typelist 净值字段代替。",
+        "年初至今涨跌幅、近 5/20/60 日与近一年涨跌幅、停牌标记、上市日期等依赖东方财富 clist 的字段，兜底行情中可能为空。量比在腾讯报价中有值时会使用（已与东方财富抽样核对）。",
+        "基金规模、运作费率、跟踪指数来自东方财富 F10（若本次或缓存中已有）；尚未获取的显示为缺失。",
         "IOPV 仍来自东方财富 stock/get 的 f71（若缓存中有），仅作盘中参考，不参与折溢价。",
       ]
     : [
@@ -476,9 +536,7 @@ function buildLivePayload(quotes: { quotes: QuoteRaw[]; fetchedAt: number; quote
     notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}，缺失资料的品种暂归入「其他」，不会仅按名称强行分类。`);
   }
   return {
-    source: tencentFallback
-      ? "腾讯行情（实时报价）；基金资料与净值仍来自东方财富缓存"
-      : getMarketProvider().label,
+    source: describeLiveSource(quotes.quoteSource, quotes.universeSource),
     fetchedAt: Math.floor(quotes.fetchedAt / 1000),
     quoteTime,
     freshness,
@@ -690,10 +748,7 @@ export async function getEtfDetail(code: string, marketHint?: number): Promise<E
   const row = mergeRow(quote, profile ?? f10Memory[code], iopv, navMemory[code]);
   const { freshness, delayed } = marketFreshness();
   return {
-    source:
-      universe.quoteSource === "tencent"
-        ? "腾讯行情（实时报价）；基金资料与净值仍来自东方财富"
-        : provider.label,
+    source: describeLiveSource(universe.quoteSource, universe.universeSource),
     fetchedAt: Math.floor(Date.now() / 1000),
     freshness,
     delayed,

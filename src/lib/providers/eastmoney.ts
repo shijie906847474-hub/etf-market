@@ -2,10 +2,12 @@ import { extractTrackingErrorTarget } from "../classify";
 import { parseFeePercent, toNum } from "../format";
 import type { FundProfile, IopvSnapshot, KlineBar, TrendPoint } from "../types";
 import { EASTMONEY_GATEWAY_UNAVAILABLE, isAbortLike, isTransientUpstreamError, UpstreamUnavailableError } from "./errors";
+import type { UniverseItem } from "./tencent";
 import type { MarketDataProvider, OfficialNav, QuoteRaw } from "./types";
 
 const PUSH_HOSTS = [
   "https://82.push2.eastmoney.com",
+  "https://94.push2.eastmoney.com",
   "https://push2.eastmoney.com",
   "https://push2delay.eastmoney.com",
 ];
@@ -216,9 +218,128 @@ function mapProfile(row: Record<string, unknown>): FundProfile {
   };
 }
 
-function looksLikeEtf(name: string): boolean {
+export function looksLikeEtf(name: string): boolean {
   if (/LOF|FOF|REITs|REIT/i.test(name) && !/ETF/i.test(name)) return false;
   return true;
+}
+
+
+const TYPELIST_COLUMNS = "SECUCODE,SECURITY_CODE,SECURITY_NAME_ABBR,INDEX_NAME,YTD_CHANGE_RATE";
+const TYPELIST_PAGE_SIZES = [200, 100];
+
+/** 优先用 SECUCODE 后缀；否则 15xxxx→深市 0，51xxxx 或 5 开头→沪市 1。 */
+export function marketFromEtfSecuCode(secucode: string | null | undefined, securityCode: string): 0 | 1 {
+  const raw = String(secucode ?? "").trim().toUpperCase();
+  const suffix = raw.includes(".") ? raw.slice(raw.lastIndexOf(".") + 1) : "";
+  if (suffix === "SH") return 1;
+  if (suffix === "SZ") return 0;
+  if (/^15/.test(securityCode)) return 0;
+  if (/^51/.test(securityCode) || /^5/.test(securityCode)) return 1;
+  return 0;
+}
+
+export function parseTypeListRow(row: Record<string, unknown>): UniverseItem | null {
+  const code = String(row.SECURITY_CODE ?? "").trim();
+  if (!/^\d{6}$/.test(code)) return null;
+  const name = String(row.SECURITY_NAME_ABBR ?? "").trim() || code;
+  if (!looksLikeEtf(name)) return null;
+  const secu = row.SECUCODE != null ? String(row.SECUCODE) : null;
+  return { code, market: marketFromEtfSecuCode(secu, code), name };
+}
+
+export function parseTypeListPage(payload: unknown): { count: number; pages: number; items: UniverseItem[]; rawCount: number } {
+  const body = payload as { success?: unknown; result?: { count?: unknown; pages?: unknown; data?: Record<string, unknown>[] } };
+  if (!body || body.success !== true || !body.result) {
+    throw new Error("东方财富 ETF 列表接口返回异常");
+  }
+  const rows = (body.result.data ?? []) as Record<string, unknown>[];
+  const items: UniverseItem[] = [];
+  for (const row of rows) {
+    const item = parseTypeListRow(row);
+    if (item) items.push(item);
+  }
+  const count = Number(body.result.count ?? 0);
+  const pages = Number(body.result.pages ?? 0);
+  return { count: Number.isFinite(count) ? count : 0, pages: Number.isFinite(pages) ? pages : 0, items, rawCount: rows.length };
+}
+
+async function fetchTypeListPage(pageNumber: number, pageSize: number): Promise<unknown> {
+  const params = new URLSearchParams({
+    sortColumns: "SECURITY_CODE",
+    sortTypes: "1",
+    pageSize: String(pageSize),
+    pageNumber: String(pageNumber),
+    reportName: "RPT_FUND_ETFLIST",
+    columns: TYPELIST_COLUMNS,
+    source: "WEB",
+    client: "WEB",
+  });
+  return fetchJson(`${F10_URL}?${params.toString()}`, 20000, { Referer: "https://fund.eastmoney.com/" });
+}
+
+/**
+ * 东方财富 datacenter-web RPT_FUND_ETFLIST 名单（代码、名称、市场）。
+ * 不是实时行情；不要把列表里的净值字段当作官方单位净值。
+ */
+export async function fetchEtfTypeList(
+  onProgress?: (done: number, total: number) => void,
+): Promise<{ total: number; items: UniverseItem[] }> {
+  let lastErr: unknown;
+  let pageSize = TYPELIST_PAGE_SIZES[0];
+  let first: ReturnType<typeof parseTypeListPage> | null = null;
+  for (const size of TYPELIST_PAGE_SIZES) {
+    try {
+      const parsed = parseTypeListPage(await fetchTypeListPage(1, size));
+      if (parsed.rawCount === 0 && parsed.count > 0) {
+        lastErr = new Error(`东方财富 ETF 列表 pageSize=${size} 未返回数据`);
+        continue;
+      }
+      pageSize = size;
+      first = parsed;
+      break;
+    } catch (err) {
+      lastErr = err;
+      console.error(`[eastmoney] typelist pageSize=${size} failed`, err);
+    }
+  }
+  if (!first) {
+    throw lastErr instanceof Error ? lastErr : new Error("东方财富 ETF 列表暂时不可用");
+  }
+
+  const total = first.count;
+  const pages = Math.max(first.pages || Math.ceil(Math.max(total, first.rawCount) / pageSize) || 1, 1);
+  const rawByCode = new Map<string, UniverseItem>();
+  let rawCount = 0;
+  const consume = (page: ReturnType<typeof parseTypeListPage>) => {
+    rawCount += page.rawCount;
+    for (const item of page.items) rawByCode.set(item.code, item);
+  };
+  consume(first);
+  onProgress?.(1, pages);
+
+  for (let pn = 2; pn <= pages; pn++) {
+    let page: ReturnType<typeof parseTypeListPage> | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        page = parseTypeListPage(await fetchTypeListPage(pn, pageSize));
+        break;
+      } catch (err) {
+        lastErr = err;
+        await sleep(250 * (attempt + 1));
+      }
+    }
+    if (!page) {
+      throw lastErr instanceof Error ? lastErr : new Error("东方财富 ETF 列表分页失败");
+    }
+    consume(page);
+    onProgress?.(pn, pages);
+  }
+
+  if (total > 0 && rawCount < total && rawCount < total * 0.98) {
+    throw new Error(`东方财富 ETF 列表不完整（${rawCount}/${total}），不会把截断名单当作全市场`);
+  }
+  const items = [...rawByCode.values()];
+  return { total: total || items.length, items };
 }
 
 export class EastMoneyProvider implements MarketDataProvider {

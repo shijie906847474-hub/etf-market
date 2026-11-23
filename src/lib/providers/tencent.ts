@@ -14,6 +14,8 @@ export type UniverseItem = { code: string; market: 0 | 1; name: string };
 
 export type QuoteSource = "eastmoney" | "tencent";
 
+export type UniverseSource = "eastmoney-clist" | "eastmoney-typelist" | "memory" | "sina";
+
 export function tencentSymbol(code: string, market: 0 | 1): string {
   return `${market === 1 ? "sh" : "sz"}${code}`;
 }
