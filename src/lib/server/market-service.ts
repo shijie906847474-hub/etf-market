@@ -1,7 +1,8 @@
 import { memoryGet, memorySet, readJsonFile, writeJsonFile } from "../cache";
 import { classifyEtf, detectStatus } from "../classify";
+import { buildRankBoards } from "../rank-boards";
 import { buildThemeHotspots } from "../themes";
-import { alignOfficialNav, isMoneyMarketFund, listedDateFromF26, operatingFeeOf, premiumFromNav, VOLUME_RATIO_SURGE } from "../format";
+import { alignOfficialNav, isMoneyMarketFund, listedDateFromF26, operatingFeeOf, premiumFromNav } from "../format";
 import { marketFreshness, shanghaiDateString } from "../market-hours";
 import { getMarketProvider } from "../providers";
 import { fetchEtfTypeList } from "../providers/eastmoney";
@@ -342,23 +343,7 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
   const active = list.filter((x) => x.status !== "终止上市");
   const withPx = active.filter((x) => x.changePct !== null);
   const aumItems = active.filter((x) => x.aum !== null);
-  const byRet = [...withPx].sort((a, b) => (b.changePct ?? 0) - (a.changePct ?? 0));
-  const surged = active.filter(
-    (x) =>
-      x.status !== "暂停交易" &&
-      x.status !== "停牌" &&
-      x.volumeRatio !== null &&
-      x.volumeRatio >= VOLUME_RATIO_SURGE &&
-      x.changePct !== null,
-  );
-  const topVolumeUp = surged
-    .filter((x) => (x.changePct ?? 0) > 0)
-    .sort((a, b) => (b.changePct ?? 0) - (a.changePct ?? 0))
-    .slice(0, 5);
-  const topVolumeDown = surged
-    .filter((x) => (x.changePct ?? 0) < 0)
-    .sort((a, b) => (a.changePct ?? 0) - (b.changePct ?? 0))
-    .slice(0, 5);
+  const ranks = buildRankBoards(active);
   const cats = buildCategories(active);
   const hotspots = buildThemeHotspots(active).map((c) => ({
     theme: c.theme,
@@ -383,10 +368,10 @@ export function buildOverview(list: EtfRow[]): MarketPayload["overview"] {
     up: withPx.filter((x) => (x.changePct ?? 0) > 0).length,
     down: withPx.filter((x) => (x.changePct ?? 0) < 0).length,
     flat: withPx.filter((x) => (x.changePct ?? 0) === 0).length,
-    topGainers: byRet.slice(0, 5),
-    topLosers: [...byRet].reverse().slice(0, 5),
-    topVolumeUp,
-    topVolumeDown,
+    topGainers: ranks.topGainers,
+    topLosers: ranks.topLosers,
+    topVolumeUp: ranks.topVolumeUp,
+    topVolumeDown: ranks.topVolumeDown,
     hotspots,
   };
 }

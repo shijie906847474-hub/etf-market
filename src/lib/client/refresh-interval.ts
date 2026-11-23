@@ -6,6 +6,11 @@ export const DEFAULT_REFRESH_INTERVAL_MS = 15000;
 export const REFRESH_INTERVAL_STORE_KEY = "etf-market-refresh-interval-ms";
 export const REFRESH_INTERVAL_EVENT = "etf-market-refresh-interval";
 
+export type RefreshMode = "manual" | "auto";
+export const DEFAULT_REFRESH_MODE: RefreshMode = "auto";
+export const REFRESH_MODE_STORE_KEY = "etf-market-refresh-mode";
+export const REFRESH_MODE_EVENT = "etf-market-refresh-mode";
+
 export const REFRESH_INTERVAL_OPTIONS: Array<{ ms: number; label: string }> = [
   { ms: 5000, label: "5 秒" },
   { ms: 10000, label: "10 秒" },
@@ -51,4 +56,41 @@ export function useRefreshInterval(): [number, (ms: number) => void] {
     };
   }, []);
   return [ms, (next) => setMs(writeRefreshIntervalMs(next))];
+}
+
+export function readRefreshMode(): RefreshMode {
+  if (typeof window === "undefined") return DEFAULT_REFRESH_MODE;
+  try {
+    const raw = window.localStorage.getItem(REFRESH_MODE_STORE_KEY);
+    if (raw === "manual" || raw === "auto") return raw;
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_REFRESH_MODE;
+}
+
+export function writeRefreshMode(mode: RefreshMode): RefreshMode {
+  const next: RefreshMode = mode === "manual" ? "manual" : "auto";
+  try {
+    window.localStorage.setItem(REFRESH_MODE_STORE_KEY, next);
+    window.dispatchEvent(new Event(REFRESH_MODE_EVENT));
+  } catch {
+    /* ignore */
+  }
+  return next;
+}
+
+export function useRefreshMode(): [RefreshMode, (mode: RefreshMode) => void] {
+  const [mode, setMode] = useState<RefreshMode>(DEFAULT_REFRESH_MODE);
+  useEffect(() => {
+    const sync = () => setMode(readRefreshMode());
+    sync();
+    window.addEventListener(REFRESH_MODE_EVENT, sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener(REFRESH_MODE_EVENT, sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+  return [mode, (next) => setMode(writeRefreshMode(next))];
 }

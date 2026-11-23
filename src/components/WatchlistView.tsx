@@ -1,13 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { changeClass, formatMoney, formatPct, formatPrice, formatShanghai, lastPriceLabel } from "@/lib/format";
 import type { EtfRow, MarketPayload } from "@/lib/types";
 import { loadWatchlist, saveWatchlist, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
 import { readLiveMarketCache, writeLiveMarketCache } from "@/lib/client/live-market-cache";
-import { useRefreshInterval } from "@/lib/client/refresh-interval";
+import { useRefreshInterval, useRefreshMode } from "@/lib/client/refresh-interval";
 
 export function WatchlistView() {
   const [groups, setGroups] = useState<WatchGroup[]>([]);
@@ -17,6 +17,11 @@ export function WatchlistView() {
   const [refreshing, setRefreshing] = useState(false);
   const [newName, setNewName] = useState("");
   const [refreshIntervalMs] = useRefreshInterval();
+  const [refreshMode] = useRefreshMode();
+  const refreshIntervalRef = useRef(refreshIntervalMs);
+  const refreshModeRef = useRef(refreshMode);
+  refreshIntervalRef.current = refreshIntervalMs;
+  refreshModeRef.current = refreshMode;
   const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(0);
   const headerRef = useRef<HTMLElement>(null);
@@ -38,36 +43,47 @@ export function WatchlistView() {
   }, []);
 
   useEffect(() => {
+    if (refreshMode !== "auto") return;
     setNowTick(Date.now());
     const id = window.setInterval(() => setNowTick(Date.now()), 1000);
     return () => window.clearInterval(id);
+  }, [refreshMode]);
+
+  const load = useCallback(async (silent: boolean) => {
+    setRefreshing(true);
+    try {
+      const res = await fetch("/api/market", { cache: "no-store" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "行情加载失败");
+      setData(json);
+      writeLiveMarketCache(json);
+      setError(null);
+    } catch (err) {
+      if (!silent) setError(err instanceof Error ? err.message : "行情加载失败");
+    } finally {
+      setRefreshing(false);
+      if (refreshModeRef.current === "auto") {
+        setNextRefreshAt(Date.now() + refreshIntervalRef.current);
+      } else {
+        setNextRefreshAt(null);
+      }
+    }
   }, []);
 
   useEffect(() => {
     setGroups(loadWatchlist());
-    const apply = (json: MarketPayload) => {
-      setData(json);
-      writeLiveMarketCache(json);
-    };
-    const load = async (silent: boolean) => {
-      if (silent) setRefreshing(true);
-      try {
-        const res = await fetch("/api/market", { cache: "no-store" });
-        const json = await res.json();
-        if (!res.ok) throw new Error(json.error || "行情加载失败");
-        apply(json);
-        setError(null);
-      } catch (err) {
-        if (!silent) setError(err instanceof Error ? err.message : "行情加载失败");
-      } finally {
-        setRefreshing(false);
-        setNextRefreshAt(Date.now() + refreshIntervalMs);
-      }
-    };
     void load(Boolean(readLiveMarketCache()));
+  }, [load]);
+
+  useEffect(() => {
+    if (refreshMode !== "auto") {
+      setNextRefreshAt(null);
+      return;
+    }
+    setNextRefreshAt(Date.now() + refreshIntervalMs);
     const id = window.setInterval(() => void load(true), refreshIntervalMs);
     return () => window.clearInterval(id);
-  }, [refreshIntervalMs]);
+  }, [refreshMode, refreshIntervalMs, load]);
 
   const persist = (next: WatchGroup[]) => {
     setGroups(next);
@@ -91,13 +107,25 @@ export function WatchlistView() {
             </Link>
             <h1 className="text-sm font-semibold">我的自选</h1>
           </div>
-          <div className="text-[11px] text-terminal-muted">
-            本地保存，无需登录 · 数据来源：{data?.source ?? "东方财富公开行情"} · {formatShanghai(data?.quoteTime ?? null)}
-            {refreshing
-              ? " · 正在刷新"
-              : nextRefreshAt != null
-                ? ` · 刷新倒计时 ${Math.max(0, Math.ceil((nextRefreshAt - (nowTick || Date.now())) / 1000))} 秒`
-                : ""}
+          <div className="flex items-center gap-2 text-[11px] text-terminal-muted">
+            <span>
+              本地保存，无需登录 · 数据来源：{data?.source ?? "东方财富公开行情"} · {formatShanghai(data?.quoteTime ?? null)}
+              {refreshing
+                ? " · 正在刷新"
+                : refreshMode === "auto" && nextRefreshAt != null
+                  ? ` · 刷新倒计时 ${Math.max(0, Math.ceil((nextRefreshAt - (nowTick || Date.now())) / 1000))} 秒`
+                  : ""}
+            </span>
+            {refreshMode === "manual" ? (
+              <button
+                type="button"
+                onClick={() => void load(Boolean(data))}
+                disabled={refreshing}
+                className="border border-terminal-border px-2 py-0.5 text-[11px] text-terminal-text disabled:opacity-40"
+              >
+                {refreshing ? "正在刷新" : "刷新"}
+              </button>
+            ) : null}
           </div>
         </div>
       </header>

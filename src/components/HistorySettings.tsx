@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { formatShanghai } from "@/lib/format";
 import { deleteAllClientHistoryCache, deleteClientHistoryCache, listClientHistoryCache } from "@/lib/client/prev-close-cache";
 import type { HistoryCacheItem } from "@/lib/types";
-import { REFRESH_INTERVAL_OPTIONS, useRefreshInterval } from "@/lib/client/refresh-interval";
+import { REFRESH_INTERVAL_OPTIONS, useRefreshInterval, useRefreshMode, type RefreshMode } from "@/lib/client/refresh-interval";
 
 function formatSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "—";
@@ -31,6 +31,7 @@ function mergeCacheItems(groups: HistoryCacheItem[][]): HistoryCacheItem[] {
 }
 
 export function HistorySettings() {
+  const [refreshMode, setRefreshMode] = useRefreshMode();
   const [refreshIntervalMs, setRefreshIntervalMs] = useRefreshInterval();
   const [items, setItems] = useState<HistoryCacheItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -133,22 +134,39 @@ export function HistorySettings() {
     <section className="px-3 py-4">
       <h2 className="text-sm font-medium">行情刷新</h2>
       <p className="mt-1 max-w-3xl text-xs leading-relaxed text-terminal-muted">
-        仅对「今日市场」和「我的自选」生效。历史市场是收盘快照，不会自动刷新。间隔保存在本机浏览器中。
+        仅对「今日市场」和「我的自选」生效。历史市场是收盘快照，不会自动刷新。偏好保存在本机浏览器中。
       </p>
-      <label className="mt-3 flex items-center gap-2 text-xs">
-        <span className="text-terminal-muted">自动刷新间隔</span>
-        <select
-          value={refreshIntervalMs}
-          onChange={(e) => setRefreshIntervalMs(Number(e.target.value))}
-          className="h-8 border border-terminal-border bg-terminal-panel px-2 text-sm"
-        >
-          {REFRESH_INTERVAL_OPTIONS.map((opt) => (
-            <option key={opt.ms} value={opt.ms}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-      </label>
+      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
+        <label className="flex items-center gap-2">
+          <span className="text-terminal-muted">刷新方式</span>
+          <select
+            value={refreshMode}
+            onChange={(e) => setRefreshMode(e.target.value as RefreshMode)}
+            className="h-8 border border-terminal-border bg-terminal-panel px-2 text-sm"
+          >
+            <option value="manual">手动刷新</option>
+            <option value="auto">自动刷新</option>
+          </select>
+        </label>
+        {refreshMode === "auto" ? (
+          <label className="flex items-center gap-2">
+            <span className="text-terminal-muted">自动刷新间隔</span>
+            <select
+              value={refreshIntervalMs}
+              onChange={(e) => setRefreshIntervalMs(Number(e.target.value))}
+              className="h-8 border border-terminal-border bg-terminal-panel px-2 text-sm"
+            >
+              {REFRESH_INTERVAL_OPTIONS.map((opt) => (
+                <option key={opt.ms} value={opt.ms}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <span className="text-terminal-muted">可在行情信息栏点击「刷新」手动更新，不会倒计时轮询。</span>
+        )}
+      </div>
 
       <h2 className="mt-8 text-sm font-medium">历史行情缓存</h2>
       <p className="mt-1 max-w-3xl text-xs leading-relaxed text-terminal-muted">

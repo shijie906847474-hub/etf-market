@@ -7,11 +7,12 @@ import { fetchMarketStream, isAbortError } from "@/lib/client/market-stream";
 import { HistorySettings } from "@/components/HistorySettings";
 import { isHistoryCacheValid, readHistoryCache, writeHistoryCache } from "@/lib/client/prev-close-cache";
 import { readLiveMarketCache, writeLiveMarketCache } from "@/lib/client/live-market-cache";
-import { useRefreshInterval } from "@/lib/client/refresh-interval";
+import { useRefreshInterval, useRefreshMode } from "@/lib/client/refresh-interval";
 import type { LoadProgress } from "@/lib/load-progress";
 import { changeClass, csvEscape, formatAum, formatDateOnly, formatMoney, formatNumber, formatPct, formatPrice, formatShanghai, formatVolumeHands, lastPriceLabel, VOLUME_RATIO_SURGE } from "@/lib/format";
 import { shanghaiDateString } from "@/lib/market-hours";
-import { buildThemeHotspots, classifyTheme, THEME_MIN_COUNT } from "@/lib/themes";
+import { buildRankBoards } from "@/lib/rank-boards";
+import { classifyTheme } from "@/lib/themes";
 import type { EtfCategory, EtfRow, MarketPayload } from "@/lib/types";
 import { isWatched, loadWatchlist, saveWatchlist, toggleWatch, type WatchGroup } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
@@ -410,8 +411,11 @@ export function MarketTerminal() {
   const [loadStartedAt, setLoadStartedAt] = useState<number | null>(null);
   const [nowTick, setNowTick] = useState(0);
   const [refreshIntervalMs] = useRefreshInterval();
+  const [refreshMode] = useRefreshMode();
   const refreshIntervalRef = useRef(refreshIntervalMs);
+  const refreshModeRef = useRef(refreshMode);
   refreshIntervalRef.current = refreshIntervalMs;
+  refreshModeRef.current = refreshMode;
   const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
   const hasLiveRef = useRef(false);
   const tradeDatesRef = useRef<string[]>([]);
@@ -499,7 +503,11 @@ export function MarketTerminal() {
       if (!opts?.signal?.aborted) {
         setLoading(false);
         setRefreshing(false);
-        if (hasLiveRef.current) setNextRefreshAt(Date.now() + refreshIntervalRef.current);
+        if (hasLiveRef.current && refreshModeRef.current === "auto") {
+          setNextRefreshAt(Date.now() + refreshIntervalRef.current);
+        } else {
+          setNextRefreshAt(null);
+        }
       }
     }
   }, [applyLive]);
@@ -609,22 +617,25 @@ export function MarketTerminal() {
   }, [view, historyDate, loadLive, loadHistory, ensureTradeDates]);
 
   useEffect(() => {
-    if (view !== "today") return;
+    if (view !== "today" || refreshMode !== "auto") {
+      setNextRefreshAt(null);
+      return;
+    }
     if (hasLiveRef.current) setNextRefreshAt(Date.now() + refreshIntervalMs);
     const id = window.setInterval(() => {
       if (!hasLiveRef.current) return;
       void loadLive({ stream: false });
     }, refreshIntervalMs);
     return () => window.clearInterval(id);
-  }, [view, refreshIntervalMs, loadLive]);
+  }, [view, refreshMode, refreshIntervalMs, loadLive]);
 
   useEffect(() => {
-    const needTick = (loading && !data) || view === "today";
+    const needTick = (loading && !data) || (view === "today" && refreshMode === "auto");
     if (!needTick) return;
     setNowTick(Date.now());
     const id = window.setInterval(() => setNowTick(Date.now()), 1000);
     return () => window.clearInterval(id);
-  }, [loading, data, view]);
+  }, [loading, data, view, refreshMode]);
 
   const listedRows = useMemo(
     () => (data ? data.list.filter((row) => row.status !== "终止上市") : []),
@@ -658,7 +669,22 @@ export function MarketTerminal() {
     setPage(1);
   };
 
-  const themeHotspots = useMemo(() => (data ? buildThemeHotspots(data.list) : []), [data]);
+  const rankUniverse = useMemo(() => {
+    return listedRows.filter((row) => {
+      if (filters.category !== "全部" && row.category !== filters.category) return false;
+      if (filters.theme && classifyTheme(row) !== filters.theme) return false;
+      return true;
+    });
+  }, [listedRows, filters.category, filters.theme]);
+
+  const rankBoards = useMemo(() => buildRankBoards(rankUniverse), [rankUniverse]);
+
+  const rankScopeLabel =
+    filters.category !== "全部" && filters.theme
+      ? `${filters.category} · ${filters.theme}`
+      : filters.category !== "全部"
+        ? filters.category
+        : filters.theme || "";
 
   const themeOptions = useMemo(() => {
     const opts: Array<[string, string]> = [["", "全部"]];
@@ -867,13 +893,24 @@ export function MarketTerminal() {
             </span>
           ) : null}
           {view === "today" && (data || refreshing) ? (
-            <span>
-              {refreshing
-                ? "正在刷新"
-                : nextRefreshAt != null
-                  ? `刷新倒计时 ${Math.max(0, Math.ceil((nextRefreshAt - (nowTick || Date.now())) / 1000))} 秒`
-                  : null}
-            </span>
+            refreshMode === "manual" ? (
+              <button
+                type="button"
+                onClick={() => void loadLive({ stream: false })}
+                disabled={refreshing}
+                className="border border-terminal-border px-2 py-0.5 text-[11px] text-terminal-text disabled:opacity-40"
+              >
+                {refreshing ? "正在刷新" : "刷新"}
+              </button>
+            ) : (
+              <span>
+                {refreshing
+                  ? "正在刷新"
+                  : nextRefreshAt != null
+                    ? `刷新倒计时 ${Math.max(0, Math.ceil((nextRefreshAt - (nowTick || Date.now())) / 1000))} 秒`
+                    : null}
+              </span>
+            )
           ) : null}
         </div>
       </header>
@@ -930,70 +967,6 @@ export function MarketTerminal() {
             </div>
           </section>
 
-          <section className="grid grid-cols-1 gap-0 border-b border-terminal-border lg:grid-cols-5">
-            <RankList title="涨幅榜 TOP 5" rows={ov.topGainers} field="changePct" />
-            <RankList title="跌幅榜 TOP 5" rows={ov.topLosers} field="changePct" />
-            {view === "today" ? (
-              <>
-                <RankList
-                  title={`放量上涨 TOP 5（量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）`}
-                  rows={ov.topVolumeUp ?? []}
-                  field="changePct"
-                  showVolumeRatio
-                  emptyText={`暂无量比≥${VOLUME_RATIO_SURGE.toFixed(2)} 的上涨品种`}
-                />
-                <RankList
-                  title={`放量下跌 TOP 5（量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）`}
-                  rows={ov.topVolumeDown ?? []}
-                  field="changePct"
-                  showVolumeRatio
-                  emptyText={`暂无量比≥${VOLUME_RATIO_SURGE.toFixed(2)} 的下跌品种`}
-                />
-              </>
-            ) : (
-              <div className="border-r border-terminal-border px-3 py-2 lg:col-span-2">
-                <div className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted">放量上涨 / 放量下跌</div>
-                <div className="text-[11px] leading-relaxed text-terminal-muted">
-                  该榜依赖盘中量比（相对近 5 日同时段均量），历史收盘快照没有这一字段，因此不展示。
-                </div>
-              </div>
-            )}
-            <div className="border-r border-terminal-border last:border-r-0 px-3 py-2">
-              <div
-                className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted"
-                title="超额收益 = 该主题成交额加权涨跌幅 − 全市场成交额加权涨跌幅（不含货币、停牌、暂停、无行情）。右侧为该主题成交额加权量比；历史收盘快照无量比。"
-              >
-                {view === "history" ? "收盘日热点主题" : "当日热点主题"}（至少{THEME_MIN_COUNT}只，超额）
-              </div>
-              {themeHotspots.length === 0 ? (
-                <div className="text-[11px] leading-relaxed text-terminal-muted">暂无满足只数要求的主题</div>
-              ) : (
-                themeHotspots.map((h) => (
-                  <button
-                    key={h.theme}
-                    type="button"
-                    onClick={() => updateFilter("theme", filters.theme === h.theme ? "" : h.theme)}
-                    className={cn(
-                      "flex w-full items-center gap-2 py-0.5 text-left text-sm hover:bg-white/5",
-                      filters.theme === h.theme && "bg-white/10",
-                    )}
-                  >
-                    <span className="min-w-0 flex-1 truncate">
-                      {h.theme}{" "}
-                      <span className="text-[11px] text-terminal-muted">
-                        {h.count}只 {h.up}/{h.down}
-                      </span>
-                    </span>
-                    <span className={cn("w-14 shrink-0 text-right font-mono tabular-nums", changeClass(h.excessReturn))}>{formatPct(h.excessReturn)}</span>
-                    <span className="w-8 shrink-0 text-right font-mono text-[11px] tabular-nums text-terminal-muted">
-                      {h.volumeRatio === null ? "" : formatNumber(h.volumeRatio, 2)}
-                    </span>
-                  </button>
-                ))
-              )}
-            </div>
-          </section>
-
           <section className="overflow-x-auto border-b border-terminal-border">
             <div className="flex min-w-[980px]">
               {(data?.categories ?? []).map((c) => (
@@ -1021,6 +994,36 @@ export function MarketTerminal() {
               ))}
             </div>
             <div className="px-3 py-1 text-[10px] text-terminal-muted">分类涨跌幅为成交额加权；分类依据 F10 基金类型与跟踪指数，缺失资料暂归「其他」。</div>
+          </section>
+
+          <section className="grid grid-cols-1 gap-0 border-b border-terminal-border lg:grid-cols-4">
+            <RankList title={rankScopeLabel ? `涨幅榜 TOP 5（${rankScopeLabel}）` : "涨幅榜 TOP 5"} rows={rankBoards.topGainers} field="changePct" />
+            <RankList title={rankScopeLabel ? `跌幅榜 TOP 5（${rankScopeLabel}）` : "跌幅榜 TOP 5"} rows={rankBoards.topLosers} field="changePct" />
+            {view === "today" ? (
+              <>
+                <RankList
+                  title={rankScopeLabel ? `放量上涨 TOP 5（${rankScopeLabel}，量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）` : `放量上涨 TOP 5（量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）`}
+                  rows={rankBoards.topVolumeUp}
+                  field="changePct"
+                  showVolumeRatio
+                  emptyText={`暂无量比≥${VOLUME_RATIO_SURGE.toFixed(2)} 的上涨品种`}
+                />
+                <RankList
+                  title={rankScopeLabel ? `放量下跌 TOP 5（${rankScopeLabel}，量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）` : `放量下跌 TOP 5（量比≥${VOLUME_RATIO_SURGE.toFixed(2)}）`}
+                  rows={rankBoards.topVolumeDown}
+                  field="changePct"
+                  showVolumeRatio
+                  emptyText={`暂无量比≥${VOLUME_RATIO_SURGE.toFixed(2)} 的下跌品种`}
+                />
+              </>
+            ) : (
+              <div className="border-r border-terminal-border px-3 py-2 lg:col-span-2">
+                <div className="mb-1 h-5 truncate text-[12px] leading-5 text-terminal-muted">放量上涨 / 放量下跌</div>
+                <div className="text-[11px] leading-relaxed text-terminal-muted">
+                  该榜依赖盘中量比（相对近 5 日同时段均量），历史收盘快照没有这一字段，因此不展示。
+                </div>
+              </div>
+            )}
           </section>
         </>
       ) : null}

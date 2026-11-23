@@ -334,9 +334,9 @@ export function marketBenchmarkReturn(list: ThemeRow[]): number | null {
 
 const HIDDEN_HOTSPOT_THEMES = new Set(["其他主题", "其他", "宽基"]);
 
-export function buildThemeHotspots(list: ThemeRow[], limit = THEME_HOTSPOT_LIMIT): ThemeStat[] {
+export function buildThemeHotspots(list: ThemeRow[], limit = THEME_HOTSPOT_LIMIT, marketList: ThemeRow[] = list): ThemeStat[] {
   const active = list.filter((x) => x.status !== "终止上市");
-  const market = marketBenchmarkReturn(list);
+  const market = marketBenchmarkReturn(marketList);
   const qualified = buildThemeStats(active)
     .map((s) => ({
       ...s,
