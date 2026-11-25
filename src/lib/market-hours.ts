@@ -39,6 +39,34 @@ export function shanghaiDateString(ts = Date.now()): string {
   return fmt.format(new Date(ts));
 }
 
+function quoteTimeMs(quoteTime: number): number {
+  // East Money f124 / 腾讯字段 30 解析结果是 Unix 秒；容错毫秒时间戳。
+  return quoteTime > 1e12 ? quoteTime : quoteTime * 1000;
+}
+
+/**
+ * 今日市场的涨跌幅只采用上海日历「今天」、且行情时间已进入 09:15（竞价开始）及之后的报价。
+ * 开盘前上游仍会挂着上一交易日的收盘价与收盘涨跌（商品/黄金 ETF 尤其容易被当成「今日」），这时返回 false。
+ */
+export function isTodaySessionQuote(quoteTime: number | null | undefined, now = Date.now()): boolean {
+  if (quoteTime == null || !Number.isFinite(quoteTime)) return false;
+  const ms = quoteTimeMs(quoteTime);
+  if (!Number.isFinite(ms) || ms <= 0) return false;
+  if (shanghaiDateString(ms) !== shanghaiDateString(now)) return false;
+  return parts(ms).hhmm >= 915;
+}
+
+/** 非当日会话行情时，今日市场的涨跌额/涨跌幅留空，不把昨日收盘涨跌或隔夜现货波动当作今日涨跌。 */
+export function liveSessionChange(
+  change: number | null,
+  changePct: number | null,
+  quoteTime: number | null | undefined,
+  now = Date.now(),
+): { change: number | null; changePct: number | null } {
+  if (isTodaySessionQuote(quoteTime, now)) return { change, changePct };
+  return { change: null, changePct: null };
+}
+
 export function shanghaiSessionCloseUnix(dateStr: string): number {
   return Math.floor(new Date(`${dateStr}T15:00:00+08:00`).getTime() / 1000);
 }

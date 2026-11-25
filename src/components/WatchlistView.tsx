@@ -109,6 +109,9 @@ export function WatchlistView() {
               ← 全市场
             </Link>
             <h1 className="text-sm font-semibold">我的自选</h1>
+            <Link href="/indexes" className="text-sm text-terminal-muted hover:text-terminal-text">
+              指数手册
+            </Link>
           </div>
           <div className="flex items-center gap-2 text-[11px] text-terminal-muted">
             <span>

@@ -1,40 +1,34 @@
+import { mapPool } from "../async-pool";
 import { deleteCacheFile, listCacheFiles, memoryDelete, memoryDeleteByPrefix, memoryGet, memorySet, readJsonFile, writeJsonFile } from "../cache";
 import { PREV_CLOSE_PAYLOAD_VERSION } from "../prev-close-version";
 import { alignOfficialNav, isMoneyMarketFund } from "../format";
 import { shanghaiDateString, shanghaiSessionCloseUnix } from "../market-hours";
 import { getMarketProvider } from "../providers";
-import { fetchKlineWithSource, type KlineFetchSource } from "../providers/eastmoney";
-import type { QuoteRaw } from "../providers/types";
+import {
+  fetchKlineWithSource,
+  probeEastMoneyDailyKline,
+  type KlineFetchSource,
+} from "../providers/eastmoney";
+import type { OfficialNav, QuoteRaw } from "../providers/types";
 import { findBarOnDate, periodReturnFromBars, yearReturnFromBars, ytdChangePctFromBars } from "../returns";
 import type { HistoryCacheItem, KlineBar, MarketPayload } from "../types";
 import { stagePercent, throttleProgress, type LoadProgress } from "../load-progress";
 import { buildCategories, buildOverview, ensureF10Ready, getCachedF10, loadQuotes, mergeRow } from "./market-service";
 
-const KLINE_CONCURRENCY = 10;
+const KLINE_CONCURRENCY = 24;
+const NAV_CONCURRENCY = 20;
+const NAV_TIMEOUT_MS = 8000;
+const NAV_ATTEMPTS = 2;
 const KLINE_LIMIT = 280;
 const TRADE_DATE_LIMIT = 800;
 const TRADE_DATES_TTL_MS = 6 * 60 * 60 * 1000;
 const ANCHOR_SECID = "1.510300";
 const CACHE_FILE_PREFIX = `prev-close-v${PREV_CLOSE_PAYLOAD_VERSION}`;
 
-async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const out = new Array<R>(items.length);
-  let next = 0;
-  async function worker() {
-    while (true) {
-      const i = next++;
-      if (i >= items.length) return;
-      out[i] = await fn(items[i], i);
-    }
-  }
-  const n = Math.min(concurrency, items.length);
-  await Promise.all(Array.from({ length: n }, () => worker()));
-  return out;
-}
-
 export async function resolvePrevTradeDate(now = Date.now()): Promise<string> {
   const today = shanghaiDateString(now);
-  const { bars } = await fetchKlineWithSource(ANCHOR_SECID, 101, 20);
+  const allowEastMoney = await probeEastMoneyDailyKline(ANCHOR_SECID, 20);
+  const { bars } = await fetchKlineWithSource(ANCHOR_SECID, 101, 20, { allowEastMoney });
   for (let i = bars.length - 1; i >= 0; i--) {
     if (bars[i].time < today) return bars[i].time;
   }
@@ -157,46 +151,75 @@ async function buildPrevClosePayload(asOfDate: string, klineLimit: number, onPro
   let traded = 0;
   let navOk = 0;
   const total = universe.quotes.length;
-  let completed = 0;
+  const workTotal = Math.max(1, total * 2);
+  let klineDone = 0;
+  let navDone = 0;
   const reportKline = throttleProgress((p) => onProgress?.(p), 200);
+  const emitWork = (label: string) => {
+    const done = klineDone + navDone;
+    reportKline({
+      stage: "klines",
+      label,
+      done,
+      total: workTotal,
+      percent: stagePercent(15, 96, done, workTotal),
+    });
+  };
   reportKline({
     stage: "klines",
-    label: "正在拉取日K与当日净值…",
+    label: "正在探测日K网关，随后并行拉取日K与当日净值…",
     done: 0,
-    total,
+    total: workTotal,
     percent: 15,
   });
 
-  const quotes = await mapPool(universe.quotes, KLINE_CONCURRENCY, async (base) => {
-    const [klineResult, officialNav] = await Promise.all([
-      fetchKlineWithSource(`${base.market}.${base.code}`, 101, klineLimit).then(
-        ({ bars, source }) => ({ ok: true as const, bars, source }),
-        () => ({ ok: false as const, bars: null, source: null as KlineFetchSource | null }),
-      ),
-      provider.fetchOfficialNav(base.code, asOfDate).catch(() => null),
-    ]);
+  // 只探测一次：push2his 在部分出口会挂起；失败后进入 30 分钟冷却，全市场只走腾讯，不再逐只回打。
+  const allowEastMoney = await probeEastMoneyDailyKline(ANCHOR_SECID, 20);
+  emitWork(allowEastMoney ? "正在并行拉取日K与当日净值…" : "东方财富日K不可用，正在并行拉取腾讯日K与当日净值…");
+
+  type KlineOutcome = {
+    ok: boolean;
+    bars: KlineBar[] | null;
+    source: KlineFetchSource | null;
+  };
+
+  const klinePromise = mapPool(universe.quotes, KLINE_CONCURRENCY, async (base) => {
+    const result: KlineOutcome = await fetchKlineWithSource(`${base.market}.${base.code}`, 101, klineLimit, {
+      allowEastMoney,
+    }).then(
+      ({ bars, source }) => ({ ok: true, bars, source }),
+      () => ({ ok: false, bars: null, source: null }),
+    );
+    klineDone += 1;
+    emitWork("正在并行拉取日K与当日净值…");
+    return result;
+  });
+
+  const navPromise = mapPool(universe.quotes, NAV_CONCURRENCY, async (base) => {
+    const officialNav = await provider
+      .fetchOfficialNav(base.code, asOfDate, { timeoutMs: NAV_TIMEOUT_MS, attempts: NAV_ATTEMPTS })
+      .catch(() => null);
+    navDone += 1;
+    emitWork("正在并行拉取日K与当日净值…");
+    return officialNav;
+  });
+
+  const [klineResults, officialNavs] = await Promise.all([klinePromise, navPromise]);
+
+  const quotes = universe.quotes.map((base, i) => {
+    const klineResult = klineResults[i];
+    const officialNav = officialNavs[i] as OfficialNav | null;
     if (officialNav) navOk += 1;
-    let row: { q: QuoteRaw; officialNav: typeof officialNav };
-    if (!klineResult.ok || !klineResult.bars) {
+    if (!klineResult?.ok || !klineResult.bars) {
       klineFail += 1;
-      row = { q: emptyQuote(base, quoteTime), officialNav };
-    } else {
-      klineOk += 1;
-      if (klineResult.source === "tencent") klineFromTencent += 1;
-      else klineFromEastMoney += 1;
-      const q = quoteFromBars(base, klineResult.bars, asOfDate, quoteTime);
-      if (q.last !== null) traded += 1;
-      row = { q, officialNav };
+      return { q: emptyQuote(base, quoteTime), officialNav };
     }
-    completed += 1;
-    reportKline({
-      stage: "klines",
-      label: "正在拉取日K与当日净值…",
-      done: completed,
-      total,
-      percent: stagePercent(15, 96, completed, total),
-    });
-    return row;
+    klineOk += 1;
+    if (klineResult.source === "tencent") klineFromTencent += 1;
+    else klineFromEastMoney += 1;
+    const q = quoteFromBars(base, klineResult.bars, asOfDate, quoteTime);
+    if (q.last !== null) traded += 1;
+    return { q, officialNav };
   });
   onProgress?.({
     stage: "assemble",
@@ -284,7 +307,8 @@ export async function listCompletedTradeDates(): Promise<string[]> {
     return tradeDatesCache.dates;
   }
   const today = shanghaiDateString();
-  const { bars } = await fetchKlineWithSource(ANCHOR_SECID, 101, TRADE_DATE_LIMIT);
+  const allowEastMoney = await probeEastMoneyDailyKline(ANCHOR_SECID, 20);
+  const { bars } = await fetchKlineWithSource(ANCHOR_SECID, 101, TRADE_DATE_LIMIT, { allowEastMoney });
   const dates = bars.map((b) => b.time).filter((time) => time < today).sort((a, b) => b.localeCompare(a));
   if (!dates.length) throw new Error("无法从日 K 线确定已结束的交易日");
   tradeDatesCache = { dates, updatedAt: Date.now() };

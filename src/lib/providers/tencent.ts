@@ -1,3 +1,4 @@
+import { withHardTimeout } from "../async-pool";
 import { toNum } from "../format";
 import type { KlineBar } from "../types";
 import { isAbortLike, isNetworkFetchError, TENCENT_KLINE_UNAVAILABLE, TENCENT_QUOTES_UNAVAILABLE, UpstreamUnavailableError } from "./errors";
@@ -229,7 +230,23 @@ const KLINE_URLS = [
   "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
 ];
 
-const KLINE_TIMEOUT_MS = 10000;
+const KLINE_TIMEOUT_MS = 8000;
+const KLINE_HARD_TIMEOUT_MS = 8500;
+
+let klinePreferredBase: string | null = null;
+
+export function resetTencentKlineState() {
+  klinePreferredBase = null;
+}
+
+export function getTencentKlinePreferredBase(): string | null {
+  return klinePreferredBase;
+}
+
+function orderedKlineBases(): string[] {
+  if (!klinePreferredBase || !KLINE_URLS.includes(klinePreferredBase)) return [...KLINE_URLS];
+  return [klinePreferredBase, ...KLINE_URLS.filter((base) => base !== klinePreferredBase)];
+}
 
 const KLINE_PERIOD: Record<101 | 102 | 103, { period: "day" | "week" | "month"; keys: string[] }> = {
   101: { period: "day", keys: ["qfqday", "day"] },
@@ -322,19 +339,28 @@ export function parseTencentKlineBars(payload: unknown, symbol: string, klt: 101
   return bars;
 }
 
-async function fetchTencentKlinePayload(url: string): Promise<unknown> {
+async function fetchTencentKlinePayload(url: string, externalSignal?: AbortSignal): Promise<unknown> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), KLINE_TIMEOUT_MS);
+  const onExternalAbort = () => ctrl.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) ctrl.abort();
+    else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+  }
   try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      cache: "no-store",
-      headers: {
-        "User-Agent": UA,
-        Referer: "https://finance.qq.com/",
-        Accept: "application/json,text/plain,*/*",
-      },
-    });
+    const res = await withHardTimeout(
+      fetch(url, {
+        signal: ctrl.signal,
+        cache: "no-store",
+        headers: {
+          "User-Agent": UA,
+          Referer: "https://finance.qq.com/",
+          Accept: "application/json,text/plain,*/*",
+        },
+      }),
+      KLINE_HARD_TIMEOUT_MS,
+      "tencent kline timeout",
+    );
     if (!res.ok) {
       console.error(`[tencent] HTTP ${res.status} ${new URL(url).host} kline`);
       throw new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE, { status: res.status, sourceHost: new URL(url).host });
@@ -342,14 +368,62 @@ async function fetchTencentKlinePayload(url: string): Promise<unknown> {
     return await res.json();
   } catch (err) {
     if (err instanceof UpstreamUnavailableError) throw err;
-    if (isAbortLike(err) || isNetworkFetchError(err)) {
-      console.error(`[tencent] ${isAbortLike(err) ? "timeout/aborted" : "fetch failed"} ${new URL(url).host} kline`);
+    if (isAbortLike(err) || isNetworkFetchError(err) || (err instanceof Error && /timeout/i.test(err.message))) {
+      if (!externalSignal?.aborted) {
+        console.error(`[tencent] ${isAbortLike(err) ? "timeout/aborted" : err instanceof Error && /timeout/i.test(err.message) ? "hard-timeout" : "fetch failed"} ${new URL(url).host} kline`);
+      }
       throw new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE, { cause: err, sourceHost: new URL(url).host });
     }
     throw err;
   } finally {
     clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", onExternalAbort);
   }
+}
+
+async function fetchTencentKlineFromHosts(symbol: string, klt: 101 | 102 | 103, query: string): Promise<KlineBar[]> {
+  const tryBase = async (base: string, signal?: AbortSignal): Promise<KlineBar[]> => {
+    const payload = await fetchTencentKlinePayload(`${base}${query}`, signal);
+    const bars = parseTencentKlineBars(payload, symbol, klt);
+    if (bars.length === 0) throw new Error("腾讯日K未返回有效K线");
+    klinePreferredBase = base;
+    return bars;
+  };
+
+  const preferred = klinePreferredBase && KLINE_URLS.includes(klinePreferredBase) ? klinePreferredBase : null;
+  if (preferred) {
+    try {
+      return await tryBase(preferred);
+    } catch {
+      klinePreferredBase = null;
+    }
+  }
+
+  const bases = orderedKlineBases();
+  const raceCtrl = new AbortController();
+  return await new Promise<KlineBar[]>((resolve, reject) => {
+    let pending = bases.length;
+    let settled = false;
+    if (pending === 0) {
+      reject(new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE));
+      return;
+    }
+    for (const base of bases) {
+      tryBase(base, raceCtrl.signal).then(
+        (bars) => {
+          if (settled) return;
+          settled = true;
+          raceCtrl.abort();
+          resolve(bars);
+        },
+        (err) => {
+          pending -= 1;
+          if (settled) return;
+          if (pending === 0) reject(err);
+        },
+      );
+    }
+  });
 }
 
 /**
@@ -362,16 +436,9 @@ export async function fetchTencentKline(secid: string, klt: 101 | 102 | 103 = 10
   const lmt = Math.max(1, Math.min(800, Math.floor(limit) || 400));
   const period = KLINE_PERIOD[klt].period;
   const query = `?param=${encodeURIComponent(`${symbol},${period},,,${lmt},qfq`)}`;
-  let lastErr: unknown;
-  for (const base of KLINE_URLS) {
-    try {
-      const payload = await fetchTencentKlinePayload(`${base}${query}`);
-      const bars = parseTencentKlineBars(payload, symbol, klt);
-      if (bars.length === 0) throw new Error("腾讯日K未返回有效K线");
-      return bars;
-    } catch (err) {
-      lastErr = err;
-    }
+  try {
+    return await fetchTencentKlineFromHosts(symbol, klt, query);
+  } catch (err) {
+    throw err instanceof Error ? err : new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE, { cause: err });
   }
-  throw lastErr instanceof Error ? lastErr : new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE, { cause: lastErr });
 }

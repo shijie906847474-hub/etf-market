@@ -855,6 +855,9 @@ export function MarketTerminal() {
             <Link href="/watchlist" className="text-terminal-muted hover:text-terminal-text">
               我的自选
             </Link>
+            <Link href="/indexes" className="text-terminal-muted hover:text-terminal-text">
+              指数手册
+            </Link>
             <button
               type="button"
               onClick={() => setView("settings")}

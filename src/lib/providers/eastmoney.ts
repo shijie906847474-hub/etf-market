@@ -1,7 +1,9 @@
+import { withHardTimeout } from "../async-pool";
 import { extractTrackingErrorTarget } from "../classify";
 import { parseFeePercent, toNum } from "../format";
 import type { FundProfile, IopvSnapshot, KlineBar, TrendPoint } from "../types";
 import { BOTH_KLINE_SOURCES_UNAVAILABLE, EASTMONEY_GATEWAY_UNAVAILABLE, isAbortLike, isNetworkFetchError, isTransientUpstreamError, UpstreamUnavailableError } from "./errors";
+import { getCachedKline, setCachedKline, type KlineFetchSource } from "./kline-cache";
 import { fetchTencentKline, type UniverseItem } from "./tencent";
 import type { MarketDataProvider, OfficialNav, QuoteRaw } from "./types";
 
@@ -343,10 +345,22 @@ export async function fetchEtfTypeList(
 }
 
 
-export type KlineFetchSource = "eastmoney" | "tencent";
+export function parseOfficialNavLsjz(payload: unknown, code: string, asOfDate: string): OfficialNav | null {
+  const body = payload as { Data?: { LSJZList?: Record<string, unknown>[] } };
+  const list = body?.Data?.LSJZList ?? [];
+  const row = list.find((item) => String(item.FSRQ ?? "").slice(0, 10) === asOfDate);
+  if (!row) return null;
+  const nav = toNum(row.DWJZ);
+  if (nav === null || nav === 0) return null;
+  return { code, date: asOfDate, nav };
+}
 
-const EM_KLINE_COOLDOWN_MS = 3 * 60 * 1000;
+export type { KlineFetchSource } from "./kline-cache";
+
+/** 冷却窗口要长于日期列表缓存与同实例二次打开历史市场的间隔，避免全市场再去打已挂掉的 push2his。 */
+const EM_KLINE_COOLDOWN_MS = 30 * 60 * 1000;
 const EM_KLINE_TIMEOUT_MS = 8000;
+const EM_KLINE_PROBE_MS = 4000;
 let emKlineCooldownUntil = 0;
 
 function parseEastMoneyKlines(payload: any): KlineBar[] {
@@ -384,43 +398,85 @@ async function fetchEastMoneyKline(secid: string, klt: 101 | 102 | 103, limit: n
 
 /**
  * 日/周/月 K：优先东方财富 push2his（前复权 fqt=1）。
- * 该网关在部分出口（含 Vercel hkg1）会 TLS 重置并抛出 fetch failed；失败后改用腾讯前复权日 K。
- * 进程内短时冷却，避免全市场逐只再去打已挂掉的 push2his。
+ * 该网关在部分出口（含 Vercel hkg1）会 TLS 重置、挂起或抛出 fetch failed；失败后改用腾讯前复权日 K。
+ * 进程内冷却后只走腾讯，不再在腾讯失败时逐只回打 push2his，以免把全市场拉取串行化。
  */
+export type FetchKlineOptions = {
+  /** 为 false 时跳过东方财富，直接走腾讯（历史收盘快照在探测失败后使用）。 */
+  allowEastMoney?: boolean;
+};
+
+export function isEastMoneyKlineCooling(now = Date.now()): boolean {
+  return now < emKlineCooldownUntil;
+}
+
+export function markEastMoneyKlineUnavailable(now = Date.now()) {
+  emKlineCooldownUntil = now + EM_KLINE_COOLDOWN_MS;
+}
+
+/**
+ * 用短硬超时探测一次 push2his。失败则进入冷却，供全市场历史快照统一改走腾讯。
+ * 冷却期内立即返回 false，不会再发请求。
+ */
+export async function probeEastMoneyDailyKline(secid: string, limit = 20): Promise<boolean> {
+  if (isEastMoneyKlineCooling()) return false;
+  try {
+    const bars = await withHardTimeout(
+      fetchEastMoneyKline(secid, 101, limit),
+      EM_KLINE_PROBE_MS,
+      "eastmoney kline probe timeout",
+    );
+    if (bars.length === 0) throw new Error("东方财富日K未返回有效K线");
+    emKlineCooldownUntil = 0;
+    setCachedKline(secid, 101, limit, bars, "eastmoney");
+    return true;
+  } catch (err) {
+    markEastMoneyKlineUnavailable();
+    console.error("[eastmoney] kline probe failed, will use Tencent for this process window", err);
+    return false;
+  }
+}
+
 export async function fetchKlineWithSource(
   secid: string,
   klt: 101 | 102 | 103 = 101,
   limit = 400,
+  opts?: FetchKlineOptions,
 ): Promise<{ bars: KlineBar[]; source: KlineFetchSource }> {
-  const now = Date.now();
+  const cached = getCachedKline(secid, klt, limit);
+  if (cached) return { bars: cached.bars, source: cached.source };
+
+  const allowEastMoney = opts?.allowEastMoney !== false && !isEastMoneyKlineCooling();
+
+  const remember = (bars: KlineBar[], source: KlineFetchSource) => {
+    setCachedKline(secid, klt, limit, bars, source);
+    return { bars, source };
+  };
+
   const tryEastMoney = async () => {
     const bars = await fetchEastMoneyKline(secid, klt, limit);
     emKlineCooldownUntil = 0;
-    return { bars, source: "eastmoney" as const };
+    return remember(bars, "eastmoney");
   };
   const tryTencent = async () => {
     const bars = await fetchTencentKline(secid, klt, limit);
-    return { bars, source: "tencent" as const };
+    return remember(bars, "tencent");
   };
 
-  if (now < emKlineCooldownUntil) {
+  if (!allowEastMoney) {
     try {
       return await tryTencent();
     } catch (tencentErr) {
-      try {
-        return await tryEastMoney();
-      } catch {
-        throw tencentErr instanceof UpstreamUnavailableError
-          ? tencentErr
-          : new UpstreamUnavailableError(BOTH_KLINE_SOURCES_UNAVAILABLE, { cause: tencentErr });
-      }
+      throw tencentErr instanceof UpstreamUnavailableError
+        ? tencentErr
+        : new UpstreamUnavailableError(BOTH_KLINE_SOURCES_UNAVAILABLE, { cause: tencentErr });
     }
   }
 
   try {
     return await tryEastMoney();
   } catch (emErr) {
-    emKlineCooldownUntil = Date.now() + EM_KLINE_COOLDOWN_MS;
+    markEastMoneyKlineUnavailable();
     console.error("[eastmoney] kline failed, trying Tencent fallback", emErr);
     try {
       return await tryTencent();
@@ -576,19 +632,24 @@ export class EastMoneyProvider implements MarketDataProvider {
     return { preClose: toNum(payload?.data?.preClose), points };
   }
 
-  async fetchOfficialNav(code: string, asOfDate: string): Promise<OfficialNav | null> {
+  async fetchOfficialNav(
+    code: string,
+    asOfDate: string,
+    opts?: { timeoutMs?: number; attempts?: number },
+  ): Promise<OfficialNav | null> {
     if (!/^\d{6}$/.test(code) || !/^\d{4}-\d{2}-\d{2}$/.test(asOfDate)) return null;
     const url = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${encodeURIComponent(code)}&pageIndex=1&pageSize=5&startDate=${encodeURIComponent(asOfDate)}&endDate=${encodeURIComponent(asOfDate)}`;
+    const timeoutMs = opts?.timeoutMs ?? 20000;
+    const attempts = Math.max(1, opts?.attempts ?? 3);
     let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       try {
-        const payload = (await fetchJson(url, 20000, { Referer: "https://fund.eastmoney.com/" })) as any;
-        const list = (payload?.Data?.LSJZList ?? []) as Record<string, unknown>[];
-        const row = list.find((item) => String(item.FSRQ ?? "").slice(0, 10) === asOfDate);
-        if (!row) return null;
-        const nav = toNum(row.DWJZ);
-        if (nav === null || nav === 0) return null;
-        return { code, date: asOfDate, nav };
+        const payload = await withHardTimeout(
+          fetchJson(url, timeoutMs, { Referer: "https://fund.eastmoney.com/" }),
+          timeoutMs + 500,
+          "official nav timeout",
+        );
+        return parseOfficialNavLsjz(payload, code, asOfDate);
       } catch (err) {
         lastErr = err;
         await sleep(200 * (attempt + 1));

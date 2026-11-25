@@ -3,7 +3,7 @@ import { classifyEtf, detectStatus } from "../classify";
 import { buildRankBoards } from "../rank-boards";
 import { buildThemeHotspots } from "../themes";
 import { alignOfficialNav, isMoneyMarketFund, listedDateFromF26, operatingFeeOf, premiumFromNav } from "../format";
-import { marketFreshness, shanghaiDateString } from "../market-hours";
+import { isTodaySessionQuote, liveSessionChange, marketFreshness, shanghaiDateString } from "../market-hours";
 import { getMarketProvider } from "../providers";
 import { fetchEtfTypeList } from "../providers/eastmoney";
 import { UNIVERSE_AND_QUOTES_UNAVAILABLE, publicUpstreamMessage, UpstreamUnavailableError } from "../providers/errors";
@@ -70,6 +70,7 @@ export function mergeRow(
   f10?: FundProfile,
   iopv?: IopvSnapshot,
   officialNav?: OfficialNav | OfficialNavEntry | null,
+  opts?: { liveSession?: boolean; now?: number },
 ): EtfRow {
   let last = q.last;
   let change = q.change;
@@ -80,6 +81,13 @@ export function mergeRow(
     last = null;
     change = null;
     changePct = null;
+  }
+  // 今日市场只展示当天会话的涨跌幅。开盘前（及商品/黄金 ETF）上游仍会返回上一交易日收盘涨跌，不能当作今日涨跌。
+  // 历史市场不传 liveSession，继续使用该收盘日自己的涨跌。
+  if (opts?.liveSession) {
+    const live = liveSessionChange(change, changePct, q.quoteTime, opts.now);
+    change = live.change;
+    changePct = live.changePct;
   }
   const category = classifyEtf(f10 ?? null);
   const spread =
@@ -476,7 +484,7 @@ function buildLivePayload(quotes: {
   quoteSource?: QuoteSource;
   universeSource?: UniverseSource;
 }): MarketPayload {
-  const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code], navMemory[q.code]));
+  const list = quotes.quotes.map((q) => mergeRow(q, f10Memory[q.code], iopvMemory[q.code], navMemory[q.code], { liveSession: true }));
   const f10Coverage = list.filter((x) => x.fundType).length;
   const iopvCoverage = list.filter((x) => x.iopv !== null).length;
   const navCoverage = list.filter((x) => x.nav !== null && x.navDate !== null).length;
@@ -519,6 +527,12 @@ function buildLivePayload(quotes: {
   }
   if (f10Coverage < list.length) {
     notes.push(`基金资料覆盖 ${f10Coverage}/${list.length}；极少数无法归入宽基/行业/主题/跨境/商品/债券/货币的品种不再单列「其他」，只出现在全市场列表中，不会仅按名称强行分类。`);
+  }
+  const staleChange = list.filter((x) => x.changePct === null && !isTodaySessionQuote(x.quoteTime)).length;
+  if (staleChange > 0) {
+    notes.push(
+      `涨跌幅只展示上海日历当天、且行情时间已进入 09:15 及之后的报价；当前有 ${staleChange}/${list.length} 只尚无今日会话行情（开盘前上游常仍挂昨日收盘涨跌，商品/黄金 ETF 同样如此），涨跌幅显示为缺失，不会用昨日收盘涨跌、IOPV、净值或商品现货隔夜波动代替。`,
+    );
   }
   return {
     source: describeLiveSource(quotes.quoteSource, quotes.universeSource),
@@ -730,7 +744,7 @@ export async function getEtfDetail(code: string, marketHint?: number): Promise<E
       statusHint: null,
     };
   }
-  const row = mergeRow(quote, profile ?? f10Memory[code], iopv, navMemory[code]);
+  const row = mergeRow(quote, profile ?? f10Memory[code], iopv, navMemory[code], { liveSession: true });
   const { freshness, delayed } = marketFreshness();
   return {
     source: describeLiveSource(universe.quoteSource, universe.universeSource),

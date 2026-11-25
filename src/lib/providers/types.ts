@@ -43,6 +43,6 @@ export interface MarketDataProvider {
   fetchFundProfiles(codes: string[]): Promise<FundProfile[]>;
   fetchKline(secid: string, klt: 101 | 102 | 103, limit?: number): Promise<KlineBar[]>;
   fetchTrends(secid: string): Promise<{ preClose: number | null; points: TrendPoint[] }>;
-  fetchOfficialNav(code: string, asOfDate: string): Promise<OfficialNav | null>;
+  fetchOfficialNav(code: string, asOfDate: string, opts?: { timeoutMs?: number; attempts?: number }): Promise<OfficialNav | null>;
   fetchLatestOfficialNav(code: string): Promise<OfficialNav | null>;
 }

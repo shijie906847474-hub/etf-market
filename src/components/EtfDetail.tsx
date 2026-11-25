@@ -7,6 +7,7 @@ import { changeClass, formatAum, formatDateOnly, formatMoney, formatNumber, form
 import type { EtfDetailPayload, KlineBar, TrendPoint } from "@/lib/types";
 import { isWatched, loadWatchlist, saveWatchlist, toggleWatch } from "@/lib/watchlist";
 import { cn } from "@/lib/cn";
+import { handbookPath } from "@/lib/index-handbook";
 
 type Period = "intraday" | "101" | "102" | "103";
 
@@ -85,6 +86,9 @@ export function EtfDetail({ code, market }: { code: string; market?: string }) {
             </Link>
             <Link href="/watchlist" className="text-sm text-terminal-muted hover:text-terminal-text">
               我的自选
+            </Link>
+            <Link href="/indexes" className="text-sm text-terminal-muted hover:text-terminal-text">
+              指数手册
             </Link>
           </div>
           <div className="text-[11px] text-terminal-muted">
@@ -226,7 +230,20 @@ export function EtfDetail({ code, market }: { code: string; market?: string }) {
               <Info label="基金经理" value={row.fundManager ?? "—"} />
               <Info label="托管人" value={row.trustee ?? "—"} />
               <Info label="基金类型" value={[row.fundType, row.level2Class].filter(Boolean).join(" / ") || "—"} />
-              <Info label="跟踪指数" value={row.indexName ?? "—"} />
+              <div className="flex justify-between gap-4 border-b border-terminal-border/60 py-1 text-sm">
+                <span className="text-terminal-muted">跟踪指数</span>
+                <span className="text-right">
+                  {row.indexName ?? "—"}
+                  {row.indexName || row.indexCode ? (
+                    <Link
+                      href={handbookPath(row.indexCode, row.indexName)}
+                      className="ml-2 text-[11px] text-terminal-muted hover:text-terminal-text"
+                    >
+                      手册
+                    </Link>
+                  ) : null}
+                </span>
+              </div>
               <Info label="业绩比较基准" value={row.benchmark ?? "—"} />
               <Info label="运作费率" value={row.operatingFee === null ? "—" : `${row.operatingFee.toFixed(2)}%`} />
               <Info
