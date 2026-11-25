@@ -1,5 +1,6 @@
 import { toNum } from "../format";
-import { isAbortLike, TENCENT_QUOTES_UNAVAILABLE, UpstreamUnavailableError } from "./errors";
+import type { KlineBar } from "../types";
+import { isAbortLike, isNetworkFetchError, TENCENT_KLINE_UNAVAILABLE, TENCENT_QUOTES_UNAVAILABLE, UpstreamUnavailableError } from "./errors";
 import type { QuoteRaw } from "./types";
 
 const UA =
@@ -182,8 +183,8 @@ async function fetchTencentChunk(symbols: string[]): Promise<QuoteRaw[]> {
     return parseTencentBody(text);
   } catch (err) {
     if (err instanceof UpstreamUnavailableError) throw err;
-    if (isAbortLike(err)) {
-      console.error(`[tencent] timeout/aborted qt.gtimg.cn chunk size=${symbols.length}`);
+    if (isAbortLike(err) || isNetworkFetchError(err)) {
+      console.error(`[tencent] ${isAbortLike(err) ? "timeout/aborted" : "fetch failed"} qt.gtimg.cn chunk size=${symbols.length}`);
       throw new UpstreamUnavailableError(TENCENT_QUOTES_UNAVAILABLE, { cause: err, sourceHost: "qt.gtimg.cn" });
     }
     throw err;
@@ -221,4 +222,156 @@ export async function fetchTencentQuotes(items: UniverseItem[]): Promise<QuoteRa
     throw lastErr instanceof Error ? lastErr : new UpstreamUnavailableError(TENCENT_QUOTES_UNAVAILABLE, { cause: lastErr });
   }
   return mergeTencentQuotes(items, collected);
+}
+
+const KLINE_URLS = [
+  "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
+  "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+];
+
+const KLINE_TIMEOUT_MS = 10000;
+
+const KLINE_PERIOD: Record<101 | 102 | 103, { period: "day" | "week" | "month"; keys: string[] }> = {
+  101: { period: "day", keys: ["qfqday", "day"] },
+  102: { period: "week", keys: ["qfqweek", "week"] },
+  103: { period: "month", keys: ["qfqmonth", "month"] },
+};
+
+export function tencentSymbolFromSecid(secid: string): string | null {
+  const [marketRaw, code] = secid.split(".");
+  if (!/^\d{6}$/.test(code ?? "")) return null;
+  const market = Number(marketRaw);
+  if (market !== 0 && market !== 1) return null;
+  return tencentSymbol(code, market);
+}
+
+/**
+ * 腾讯 newfqkline 第 9 段（下标 8）为成交额，单位万元。
+ * 2026-11-23（Asia/Shanghai）510300：558927.82 × 10000 = 5,589,278,200 元，
+ * 与成交量 13,939,903 手 × 100 × 当日均价相符；与东方财富日 K / clist f6（元）对齐。
+ * 六字段的 web.ifzq fqkline 没有该段，返回 null，不会把缺失当成 0。
+ */
+export function parseTencentKlineAmountYuan(fields: unknown[]): number | null {
+  if (fields.length < 9) return null;
+  const raw = fields[8];
+  if (raw == null || typeof raw === "object") return null;
+  const wan = toNum(raw as string | number);
+  if (wan === null) return null;
+  // 万元 × 10000；用四舍五入避免 558927.82 * 10000 这类二进制浮点误差。
+  return Math.round(wan * 10000);
+}
+
+function scalarNum(value: unknown): number | null {
+  if (value == null || typeof value === "object") return null;
+  return toNum(value as string | number);
+}
+
+export function parseTencentKlineBars(payload: unknown, symbol: string, klt: 101 | 102 | 103): KlineBar[] {
+  const sym = symbol.toLowerCase();
+  const body = payload as { code?: unknown; data?: Record<string, Record<string, unknown>> };
+  if (!body || Number(body.code) !== 0 || !body.data || !body.data[sym]) {
+    throw new Error("腾讯日K接口返回异常");
+  }
+  const block = body.data[sym];
+  let rows: unknown[] | null = null;
+  for (const key of KLINE_PERIOD[klt].keys) {
+    const value = block[key];
+    if (Array.isArray(value) && value.length > 0) {
+      rows = value;
+      break;
+    }
+  }
+  if (!rows) return [];
+
+  const bars: KlineBar[] = [];
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 6) continue;
+    const time = String(row[0] ?? "").slice(0, 10);
+    const open = Number(row[1]);
+    const close = Number(row[2]);
+    const high = Number(row[3]);
+    const low = Number(row[4]);
+    const volume = Number(row[5]);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(time) || !Number.isFinite(open) || !Number.isFinite(close)) continue;
+    const amount = parseTencentKlineAmountYuan(row);
+    bars.push({
+      time,
+      open,
+      close,
+      high: Number.isFinite(high) ? high : open,
+      low: Number.isFinite(low) ? low : open,
+      volume: Number.isFinite(volume) ? volume : Number.NaN,
+      amount: amount ?? Number.NaN,
+      amplitude: null,
+      changePct: null,
+      change: null,
+      turnoverRate: scalarNum(row[7]),
+    });
+  }
+  for (let i = 0; i < bars.length; i++) {
+    const prev = i > 0 ? bars[i - 1].close : null;
+    const bar = bars[i];
+    if (prev && prev !== 0) {
+      bar.change = Number((bar.close - prev).toFixed(6));
+      bar.changePct = Number((((bar.close - prev) / prev) * 100).toFixed(4));
+      if (Number.isFinite(bar.high) && Number.isFinite(bar.low)) {
+        bar.amplitude = Number((((bar.high - bar.low) / prev) * 100).toFixed(4));
+      }
+    }
+  }
+  return bars;
+}
+
+async function fetchTencentKlinePayload(url: string): Promise<unknown> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), KLINE_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      cache: "no-store",
+      headers: {
+        "User-Agent": UA,
+        Referer: "https://finance.qq.com/",
+        Accept: "application/json,text/plain,*/*",
+      },
+    });
+    if (!res.ok) {
+      console.error(`[tencent] HTTP ${res.status} ${new URL(url).host} kline`);
+      throw new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE, { status: res.status, sourceHost: new URL(url).host });
+    }
+    return await res.json();
+  } catch (err) {
+    if (err instanceof UpstreamUnavailableError) throw err;
+    if (isAbortLike(err) || isNetworkFetchError(err)) {
+      console.error(`[tencent] ${isAbortLike(err) ? "timeout/aborted" : "fetch failed"} ${new URL(url).host} kline`);
+      throw new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE, { cause: err, sourceHost: new URL(url).host });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 腾讯前复权日/周/月 K。价格、成交量（手）与东方财富 fqt=1 日 K 抽样一致。
+ * 成交额仅在 newfqkline 中提供（万元 → 元）。不会把实时最新价或昨收当作官方净值。
+ */
+export async function fetchTencentKline(secid: string, klt: 101 | 102 | 103 = 101, limit = 400): Promise<KlineBar[]> {
+  const symbol = tencentSymbolFromSecid(secid);
+  if (!symbol) throw new Error(`无效的 secid：${secid}`);
+  const lmt = Math.max(1, Math.min(800, Math.floor(limit) || 400));
+  const period = KLINE_PERIOD[klt].period;
+  const query = `?param=${encodeURIComponent(`${symbol},${period},,,${lmt},qfq`)}`;
+  let lastErr: unknown;
+  for (const base of KLINE_URLS) {
+    try {
+      const payload = await fetchTencentKlinePayload(`${base}${query}`);
+      const bars = parseTencentKlineBars(payload, symbol, klt);
+      if (bars.length === 0) throw new Error("腾讯日K未返回有效K线");
+      return bars;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new UpstreamUnavailableError(TENCENT_KLINE_UNAVAILABLE, { cause: lastErr });
 }

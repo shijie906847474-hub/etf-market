@@ -3,6 +3,7 @@ import { PREV_CLOSE_PAYLOAD_VERSION } from "../prev-close-version";
 import { alignOfficialNav, isMoneyMarketFund } from "../format";
 import { shanghaiDateString, shanghaiSessionCloseUnix } from "../market-hours";
 import { getMarketProvider } from "../providers";
+import { fetchKlineWithSource, type KlineFetchSource } from "../providers/eastmoney";
 import type { QuoteRaw } from "../providers/types";
 import { findBarOnDate, periodReturnFromBars, yearReturnFromBars, ytdChangePctFromBars } from "../returns";
 import type { HistoryCacheItem, KlineBar, MarketPayload } from "../types";
@@ -33,7 +34,7 @@ async function mapPool<T, R>(items: T[], concurrency: number, fn: (item: T, inde
 
 export async function resolvePrevTradeDate(now = Date.now()): Promise<string> {
   const today = shanghaiDateString(now);
-  const bars = await getMarketProvider().fetchKline(ANCHOR_SECID, 101, 20);
+  const { bars } = await fetchKlineWithSource(ANCHOR_SECID, 101, 20);
   for (let i = bars.length - 1; i >= 0; i--) {
     if (bars[i].time < today) return bars[i].time;
   }
@@ -151,6 +152,8 @@ async function buildPrevClosePayload(asOfDate: string, klineLimit: number, onPro
   const quoteTime = shanghaiSessionCloseUnix(asOfDate);
   let klineOk = 0;
   let klineFail = 0;
+  let klineFromTencent = 0;
+  let klineFromEastMoney = 0;
   let traded = 0;
   let navOk = 0;
   const total = universe.quotes.length;
@@ -166,9 +169,9 @@ async function buildPrevClosePayload(asOfDate: string, klineLimit: number, onPro
 
   const quotes = await mapPool(universe.quotes, KLINE_CONCURRENCY, async (base) => {
     const [klineResult, officialNav] = await Promise.all([
-      provider.fetchKline(`${base.market}.${base.code}`, 101, klineLimit).then(
-        (bars) => ({ ok: true as const, bars }),
-        () => ({ ok: false as const, bars: null }),
+      fetchKlineWithSource(`${base.market}.${base.code}`, 101, klineLimit).then(
+        ({ bars, source }) => ({ ok: true as const, bars, source }),
+        () => ({ ok: false as const, bars: null, source: null as KlineFetchSource | null }),
       ),
       provider.fetchOfficialNav(base.code, asOfDate).catch(() => null),
     ]);
@@ -179,6 +182,8 @@ async function buildPrevClosePayload(asOfDate: string, klineLimit: number, onPro
       row = { q: emptyQuote(base, quoteTime), officialNav };
     } else {
       klineOk += 1;
+      if (klineResult.source === "tencent") klineFromTencent += 1;
+      else klineFromEastMoney += 1;
       const q = quoteFromBars(base, klineResult.bars, asOfDate, quoteTime);
       if (q.last !== null) traded += 1;
       row = { q, officialNav };
@@ -222,18 +227,29 @@ async function buildPrevClosePayload(asOfDate: string, klineLimit: number, onPro
   const notes = [
     `「历史市场」展示 ${asOfDate} 这一完整交易日的收盘行情，不是今天的实时报价。`,
     "可选日期为沪深300ETF（510300）日 K 中早于上海日历当天的交易日，会跳过周末与节假日，也不会把尚未收盘的今天当作历史行情。",
-    "价格、涨跌、成交额/量、换手、开高低取自该日 K 线；昨收为再前一交易日收盘价。买卖一档、价差、量比、IOPV 为盘中字段，收盘快照中显示为缺失。",
+    klineFromTencent > 0
+      ? klineFromEastMoney > 0
+        ? "价格、涨跌、成交额/量、换手、开高低优先取自东方财富日 K（前复权 fqt=1）；部分品种因该网关不可用改用腾讯财经前复权日 K（newfqkline，qfq）。腾讯成交量单位为手，成交额已从万元换算为元。昨收为再前一交易日收盘价。买卖一档、价差、量比、IOPV 为盘中字段，收盘快照中显示为缺失。不会把腾讯最新价或昨收当作官方净值。"
+        : "价格、涨跌、成交额/量、换手、开高低取自腾讯财经前复权日 K（newfqkline，qfq），因东方财富 push2his 日 K 暂时不可用而启用兜底。成交量单位为手，成交额已从万元换算为元。昨收为再前一交易日收盘价。买卖一档、价差、量比、IOPV 为盘中字段，收盘快照中显示为缺失。不会把腾讯最新价或昨收当作官方净值，也不会把今日市场的当日行情快照当作官方收盘磁带。"
+      : "价格、涨跌、成交额/量、换手、开高低取自该日 K 线；昨收为再前一交易日收盘价。买卖一档、价差、量比、IOPV 为盘中字段，收盘快照中显示为缺失。",
     "收盘溢价率（净值）= (该日收盘价 − 当日基金份额净值) / 当日净值 × 100。净值取自东方财富基金历史净值接口 lsjz 的 DWJZ，且必须 FSRQ 等于该收盘日；不会用更早的净值、IOPV、昨收或估值去填补。收益结转型货币基金的 lsjz DWJZ 是每万份收益，收盘溢价改按官方单位净值 1.00 元对齐到与收盘价相同的报价单位（通常为每百份 100 元）；净值型货币仍用当日公布的单位净值。",
     "当日净值尚未公布的品种（跨境/QDII 常见为 T+1 才披露）收盘溢价显示为 —。今日市场的折溢价改用最新已公布净值，口径与常见券商一致，但也必须标注净值日期。",
     "今年涨跌幅按该日收盘价相对上一自然年最后交易日收盘价计算：(收盘价 / 上年最后收盘价) - 1；若当年上市、没有上年收盘，则用上市后最早收盘价。",
     "基金规模、运作费率、跟踪指数等资料来自 F10（规模为 NEW_SCALE 及披露日；运作费率 = DEC_GUANLIFEI + DEC_TUOGUANFEI），不是盘中跳动字段。",
-    `日 K 覆盖 ${klineOk}/${list.length}，失败 ${klineFail} 只；有成交的收盘记录 ${traded} 只。失败或当日无成交量/成交额的品种按无行情展示，不会用今价或昨收填补。`,
+    klineFromTencent > 0
+      ? `日 K 覆盖 ${klineOk}/${list.length}（腾讯 ${klineFromTencent}，东方财富 ${klineFromEastMoney}），失败 ${klineFail} 只；有成交的收盘记录 ${traded} 只。失败或当日无成交量/成交额的品种按无行情展示，不会用今价或昨收填补。`
+      : `日 K 覆盖 ${klineOk}/${list.length}，失败 ${klineFail} 只；有成交的收盘记录 ${traded} 只。失败或当日无成交量/成交额的品种按无行情展示，不会用今价或昨收填补。`,
     `净值覆盖 ${navCoverage}/${list.length}（同日 lsjz 返回 ${navOk} 只）；缺少同日净值或缺少有效收盘价时溢价为 —。`,
     "该快照按收盘日期缓存在服务端本地（内存与文件），同一日期再次打开会直接读取缓存，无需重复拉取。可在设置中查看、删除已缓存日期。",
   ];
 
   const payload: MarketPayload = {
-    source: `${provider.label}（历史收盘 ${asOfDate}）`,
+    source:
+      klineFromTencent > 0 && klineFromEastMoney === 0
+        ? `腾讯财经前复权日K（历史收盘 ${asOfDate}）；基金资料与净值仍来自东方财富`
+        : klineFromTencent > 0
+          ? `东方财富公开行情 / 腾讯日K兜底（历史收盘 ${asOfDate}）`
+          : `${provider.label}（历史收盘 ${asOfDate}）`,
     fetchedAt: Math.floor(Date.now() / 1000),
     quoteTime,
     freshness: "已收盘（日终行情）",
@@ -268,7 +284,7 @@ export async function listCompletedTradeDates(): Promise<string[]> {
     return tradeDatesCache.dates;
   }
   const today = shanghaiDateString();
-  const bars = await getMarketProvider().fetchKline(ANCHOR_SECID, 101, TRADE_DATE_LIMIT);
+  const { bars } = await fetchKlineWithSource(ANCHOR_SECID, 101, TRADE_DATE_LIMIT);
   const dates = bars.map((b) => b.time).filter((time) => time < today).sort((a, b) => b.localeCompare(a));
   if (!dates.length) throw new Error("无法从日 K 线确定已结束的交易日");
   tradeDatesCache = { dates, updatedAt: Date.now() };

@@ -1,8 +1,8 @@
 import { extractTrackingErrorTarget } from "../classify";
 import { parseFeePercent, toNum } from "../format";
 import type { FundProfile, IopvSnapshot, KlineBar, TrendPoint } from "../types";
-import { EASTMONEY_GATEWAY_UNAVAILABLE, isAbortLike, isTransientUpstreamError, UpstreamUnavailableError } from "./errors";
-import type { UniverseItem } from "./tencent";
+import { BOTH_KLINE_SOURCES_UNAVAILABLE, EASTMONEY_GATEWAY_UNAVAILABLE, isAbortLike, isNetworkFetchError, isTransientUpstreamError, UpstreamUnavailableError } from "./errors";
+import { fetchTencentKline, type UniverseItem } from "./tencent";
 import type { MarketDataProvider, OfficialNav, QuoteRaw } from "./types";
 
 const PUSH_HOSTS = [
@@ -120,7 +120,7 @@ async function fetchJson(url: string, timeoutMs = 20000, extraHeaders?: Record<s
     return await res.json();
   } catch (err) {
     if (err instanceof UpstreamUnavailableError) throw err;
-    if (isAbortLike(err)) throwFriendlyUpstream(url, err);
+    if (isAbortLike(err) || isNetworkFetchError(err)) throwFriendlyUpstream(url, err);
     throw err;
   } finally {
     clearTimeout(timer);
@@ -342,6 +342,99 @@ export async function fetchEtfTypeList(
   return { total: total || items.length, items };
 }
 
+
+export type KlineFetchSource = "eastmoney" | "tencent";
+
+const EM_KLINE_COOLDOWN_MS = 3 * 60 * 1000;
+const EM_KLINE_TIMEOUT_MS = 8000;
+let emKlineCooldownUntil = 0;
+
+function parseEastMoneyKlines(payload: any): KlineBar[] {
+  const klines: string[] = payload?.data?.klines ?? [];
+  return klines
+    .map((line) => {
+      const p = line.split(",");
+      return {
+        time: p[0],
+        open: Number(p[1]),
+        close: Number(p[2]),
+        high: Number(p[3]),
+        low: Number(p[4]),
+        volume: Number(p[5]),
+        amount: Number(p[6]),
+        amplitude: toNum(p[7]),
+        changePct: toNum(p[8]),
+        change: toNum(p[9]),
+        turnoverRate: toNum(p[10]),
+      } satisfies KlineBar;
+    })
+    .filter((b) => Number.isFinite(b.open) && Number.isFinite(b.close));
+}
+
+async function fetchEastMoneyKline(secid: string, klt: 101 | 102 | 103, limit: number): Promise<KlineBar[]> {
+  const payload = await fetchWithHosts(
+    `/api/qt/stock/kline/get?secid=${encodeURIComponent(secid)}&klt=${klt}&fqt=1&lmt=${limit}&end=20500101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61`,
+    HIS_HOSTS,
+    EM_KLINE_TIMEOUT_MS,
+  );
+  const bars = parseEastMoneyKlines(payload);
+  if (bars.length === 0) throw new Error("东方财富日K未返回有效K线");
+  return bars;
+}
+
+/**
+ * 日/周/月 K：优先东方财富 push2his（前复权 fqt=1）。
+ * 该网关在部分出口（含 Vercel hkg1）会 TLS 重置并抛出 fetch failed；失败后改用腾讯前复权日 K。
+ * 进程内短时冷却，避免全市场逐只再去打已挂掉的 push2his。
+ */
+export async function fetchKlineWithSource(
+  secid: string,
+  klt: 101 | 102 | 103 = 101,
+  limit = 400,
+): Promise<{ bars: KlineBar[]; source: KlineFetchSource }> {
+  const now = Date.now();
+  const tryEastMoney = async () => {
+    const bars = await fetchEastMoneyKline(secid, klt, limit);
+    emKlineCooldownUntil = 0;
+    return { bars, source: "eastmoney" as const };
+  };
+  const tryTencent = async () => {
+    const bars = await fetchTencentKline(secid, klt, limit);
+    return { bars, source: "tencent" as const };
+  };
+
+  if (now < emKlineCooldownUntil) {
+    try {
+      return await tryTencent();
+    } catch (tencentErr) {
+      try {
+        return await tryEastMoney();
+      } catch {
+        throw tencentErr instanceof UpstreamUnavailableError
+          ? tencentErr
+          : new UpstreamUnavailableError(BOTH_KLINE_SOURCES_UNAVAILABLE, { cause: tencentErr });
+      }
+    }
+  }
+
+  try {
+    return await tryEastMoney();
+  } catch (emErr) {
+    emKlineCooldownUntil = Date.now() + EM_KLINE_COOLDOWN_MS;
+    console.error("[eastmoney] kline failed, trying Tencent fallback", emErr);
+    try {
+      return await tryTencent();
+    } catch (tencentErr) {
+      console.error("[eastmoney] Tencent kline fallback failed", tencentErr);
+      throw new UpstreamUnavailableError(BOTH_KLINE_SOURCES_UNAVAILABLE, { cause: tencentErr });
+    }
+  }
+}
+
+export function resetKlineFallbackState() {
+  emKlineCooldownUntil = 0;
+}
+
 export class EastMoneyProvider implements MarketDataProvider {
   id = "eastmoney";
   label = "东方财富公开行情";
@@ -455,29 +548,8 @@ export class EastMoneyProvider implements MarketDataProvider {
   }
 
   async fetchKline(secid: string, klt: 101 | 102 | 103, limit = 400): Promise<KlineBar[]> {
-    const payload = await fetchWithHosts(
-      `/api/qt/stock/kline/get?secid=${encodeURIComponent(secid)}&klt=${klt}&fqt=1&lmt=${limit}&end=20500101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61`,
-      HIS_HOSTS,
-    );
-    const klines: string[] = payload?.data?.klines ?? [];
-    return klines
-      .map((line) => {
-        const p = line.split(",");
-        return {
-          time: p[0],
-          open: Number(p[1]),
-          close: Number(p[2]),
-          high: Number(p[3]),
-          low: Number(p[4]),
-          volume: Number(p[5]),
-          amount: Number(p[6]),
-          amplitude: toNum(p[7]),
-          changePct: toNum(p[8]),
-          change: toNum(p[9]),
-          turnoverRate: toNum(p[10]),
-        } satisfies KlineBar;
-      })
-      .filter((b) => Number.isFinite(b.open) && Number.isFinite(b.close));
+    const { bars } = await fetchKlineWithSource(secid, klt, limit);
+    return bars;
   }
 
   async fetchTrends(secid: string): Promise<{ preClose: number | null; points: TrendPoint[] }> {

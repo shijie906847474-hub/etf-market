@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "verify:data": "npx --yes tsx scripts/verify-data.ts",
     "test:tencent": "tsx scripts/parse-tencent-quote.ts",
-    "test:universe": "tsx scripts/parse-universe-fallback.ts"
+    "test:universe": "tsx scripts/parse-universe-fallback.ts",
+    "test:kline": "tsx scripts/parse-tencent-kline.ts"
   },
   "dependencies": {
     "clsx": "^2.1.1",
